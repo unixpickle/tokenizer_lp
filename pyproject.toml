@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 tokenizer-lp-train = "tokenisation_lp.train_eval:main"
+tokenizer-lp-branch-split = "tokenisation_lp.branch_split_lp:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -399,8 +399,9 @@ class HighsWarmLpSolver:
         self.highs.setOptionValue("output_flag", False)
         self.highs.setOptionValue("solver", "simplex")
         self.highs.setOptionValue("simplex_strategy", 1)
-        self.highs.setOptionValue("presolve", "off")
+        self.highs.setOptionValue("presolve", "on")
         self.highs.passModel(self._build_model())
+        self.has_basis = False
 
     def solve(self):
         cached = self._load_cache()
@@ -423,6 +424,7 @@ class HighsWarmLpSolver:
             fun=objective,
             message=message,
         )
+        self.has_basis = True
         self._save_cache(result)
         return result
 
@@ -440,6 +442,8 @@ class HighsWarmLpSolver:
         if A_rows.shape[0] == 0:
             return
 
+        if self.has_basis:
+            self.highs.setOptionValue("presolve", "off")
         row_lower = np.full(A_rows.shape[0], -self.highspy.kHighsInf, dtype=float)
         row_upper = b_rows.astype(float, copy=False)
         self.highs.addRows(
@@ -453,6 +457,14 @@ class HighsWarmLpSolver:
         )
         self.A_ub = sp.vstack([self.A_ub, A_rows], format="csr")
         self.b_ub = np.concatenate([self.b_ub, b_rows])
+
+    def change_col_bounds(self, col_idx: int, lower: float, upper: float) -> None:
+        if self.has_basis:
+            self.highs.setOptionValue("presolve", "off")
+        self.highs.changeColBounds(int(col_idx), float(lower), float(upper))
+        self.lb[col_idx] = float(lower)
+        self.ub[col_idx] = float(upper)
+        self.bounds[col_idx] = (float(lower), float(upper))
 
     def _build_model(self):
         highspy = self.highspy
@@ -650,6 +662,62 @@ def separate_cuts(
                 top_colors_per_word=7,
             )
         )
+    if "global_rank_count" in family_set:
+        violations.extend(
+            separate_global_rank_count_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
+    if "word_rank_count" in family_set:
+        violations.extend(
+            separate_word_rank_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                family_name="word_rank_count",
+                edge_weight="count",
+            )
+        )
+    if "word_rank_length" in family_set:
+        violations.extend(
+            separate_word_rank_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                family_name="word_rank_length",
+                edge_weight="length",
+            )
+        )
+    if "path_min_cover" in family_set:
+        violations.extend(
+            separate_path_min_cover_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
+    if "group_value" in family_set:
+        violations.extend(
+            separate_group_value_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
     if "window_overlap" in family_set:
         violations.extend(
             separate_window_overlap_cut_specs(
@@ -724,6 +792,79 @@ def separate_cuts(
         [key for _, key, _, _ in selected],
         float(selected[0][0]),
     )
+
+
+def separate_word_rank_cut_specs(
+    lp,
+    f_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    family_name: str,
+    edge_weight: str,
+    max_words: int = 500,
+    max_rank: int = 5,
+):
+    """Separate full-word small-rank interval-capacity cuts."""
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        by_color = defaultdict(list)
+        scores = defaultdict(float)
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            value = float(f_values[edge_idx])
+            if value <= tolerance:
+                continue
+            info = lp["nonfree_edge_info"][edge_idx]
+            coeff = edge_capacity_weight(info, edge_weight)
+            token_idx = info["token_index"]
+            by_color[token_idx].append((edge_idx, coeff))
+            scores[token_idx] += coeff * value
+
+        if len(scores) < 2:
+            continue
+        selected_tokens = tuple(
+            token_idx
+            for token_idx, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:max_rank]
+        )
+        full_key = (family_name, word_idx, selected_tokens)
+        if full_key in existing_cut_keys:
+            continue
+
+        selected_edges = [
+            (edge_idx, token_idx, coeff)
+            for token_idx in selected_tokens
+            for edge_idx, coeff in by_color[token_idx]
+        ]
+        capacities = subset_edge_capacities(lp, selected_edges, selected_tokens)
+        bound = modular_upper_bound_for_capacities(capacities, t_values, selected_tokens)
+        if bound is None:
+            continue
+        alpha, beta_values, rhs_at_current = bound
+        usage = sum(coeff * float(f_values[edge_idx]) for edge_idx, _, coeff in selected_edges)
+        violation = usage - rhs_at_current
+        if violation <= tolerance:
+            continue
+
+        beta_key = tuple(round(float(beta), 8) for beta in beta_values)
+        keyed_full_key = (*full_key, beta_key)
+        if keyed_full_key in existing_cut_keys:
+            continue
+
+        entries = [(edge_idx, float(coeff)) for edge_idx, _, coeff in selected_edges]
+        entries.extend(
+            (t_offset + token_idx, -float(beta))
+            for token_idx, beta in zip(selected_tokens, beta_values)
+            if abs(beta) > 1e-12
+        )
+        violations.append((violation, keyed_full_key, entries, float(alpha)))
+
+    return violations
 
 
 def separate_byte_boundary_cut_specs(
@@ -814,6 +955,86 @@ def separate_global_token_packing_cut_specs(
         entries = [(edge_idx, coeff) for edge_idx, coeff in zip(edge_indices, coefficients)]
         entries.append((t_offset + token_index, -max_pack))
         violations.append((violation, full_key, entries, 0.0))
+
+    return violations
+
+
+def separate_global_rank_count_cut_specs(
+    lp,
+    f_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    rank: int = 3,
+    max_words: int = 1000,
+    top_colors_per_word: int = 8,
+):
+    """Separate weighted corpus-level small-rank count-capacity cuts."""
+
+    rank_data = {}
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        by_color = defaultdict(list)
+        scores = defaultdict(float)
+        word_weight = float(lp["word_weights"][word_idx])
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            value = float(f_values[edge_idx])
+            if value <= tolerance:
+                continue
+            token_idx = lp["nonfree_edge_info"][edge_idx]["token_index"]
+            by_color[token_idx].append(edge_idx)
+            scores[token_idx] += word_weight * value
+
+        colors = [
+            token_idx
+            for token_idx, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_colors_per_word]
+        ]
+        for color_tuple in combinations(colors, rank):
+            color_tuple = tuple(sorted(color_tuple))
+            data = rank_data.setdefault(
+                color_tuple,
+                {
+                    "entries": [],
+                    "capacities": {mask: 0.0 for mask in range(1 << rank)},
+                },
+            )
+            for token_idx in color_tuple:
+                data["entries"].extend((edge_idx, word_weight) for edge_idx in by_color[token_idx])
+
+            for mask in range(1, 1 << rank):
+                mask_edges = []
+                for bit, token_idx in enumerate(color_tuple):
+                    if mask & (1 << bit):
+                        mask_edges.extend(by_color[token_idx])
+                data["capacities"][mask] += word_weight * color_window_capacity(
+                    lp,
+                    [(edge_idx, 1.0) for edge_idx in mask_edges],
+                )
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+
+    for color_tuple, data in rank_data.items():
+        full_key = ("global_rank_count", *color_tuple)
+        if full_key in existing_cut_keys:
+            continue
+        bound = modular_upper_bound_for_capacities(data["capacities"], t_values, color_tuple)
+        if bound is None:
+            continue
+        alpha, beta_values, rhs_at_current = bound
+        usage = sum(coeff * float(f_values[edge_idx]) for edge_idx, coeff in data["entries"])
+        violation = usage - rhs_at_current
+        if violation <= tolerance:
+            continue
+        entries = list(data["entries"])
+        entries.extend(
+            (t_offset + token_idx, -float(beta))
+            for token_idx, beta in zip(color_tuple, beta_values)
+            if abs(beta) > 1e-12
+        )
+        violations.append((violation, full_key, entries, float(alpha)))
 
     return violations
 
@@ -1136,7 +1357,19 @@ def rank_suspicious_words(lp, f_values, *, max_words: int):
     return [word_idx for _, word_idx in scores[:max_words]]
 
 
+def edge_capacity_weight(info, edge_weight: str) -> float:
+    if edge_weight == "count":
+        return 1.0
+    if edge_weight == "length":
+        return float(max(1, info["end"] - info["start"]))
+    raise ValueError(f"Unsupported edge capacity weight {edge_weight!r}")
+
+
 def subset_window_capacities(lp, selected_edges, selected_tokens):
+    return subset_edge_capacities(lp, selected_edges, selected_tokens)
+
+
+def subset_edge_capacities(lp, selected_edges, selected_tokens):
     token_position = {token_idx: bit for bit, token_idx in enumerate(selected_tokens)}
     capacities = {}
     for mask in range(1 << len(selected_tokens)):
@@ -1416,6 +1649,279 @@ def separate_word_path_cover_cut_specs(
     return violations
 
 
+def separate_path_min_cover_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 150,
+    max_paths_per_word: int = 20000,
+    max_universe: int = 80,
+):
+    """Separate path-cover cuts with an exact minimum-weight hitting set."""
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        nonfree_edges = lp["word_nonfree_edges"].get(word_idx, [])
+        free_edges = lp["word_free_edges"].get(word_idx, [])
+        word_cost = float(f_values[nonfree_edges].sum() + g_values[free_edges].sum())
+        if word_cost <= 1.0 + tolerance:
+            continue
+
+        k_value = int(np.floor(word_cost + 1e-9))
+        if k_value <= 0:
+            continue
+
+        path_token_sets = enumerate_short_path_token_sets(
+            lp,
+            word_idx,
+            k_value,
+            max_paths=max_paths_per_word,
+        )
+        if path_token_sets is None or not path_token_sets:
+            continue
+        if any(len(token_set) == 0 for token_set in path_token_sets):
+            continue
+
+        token_universe = sorted(set().union(*path_token_sets))
+        if len(token_universe) > max_universe:
+            continue
+        hitting_set = exact_min_weight_hitting_set(path_token_sets, t_values, token_universe)
+        if not hitting_set:
+            continue
+
+        full_key = ("path_min_cover", word_idx, k_value, tuple(sorted(hitting_set)))
+        if full_key in existing_cut_keys:
+            continue
+
+        t_sum = float(t_values[list(hitting_set)].sum())
+        lhs_value = word_cost + k_value * t_sum
+        rhs_value = float(k_value + 1)
+        violation = rhs_value - lhs_value
+        if violation <= tolerance:
+            continue
+
+        entries = []
+        entries.extend((edge_idx, -1.0) for edge_idx in nonfree_edges)
+        entries.extend((num_f + edge_idx, -1.0) for edge_idx in free_edges)
+        entries.extend((t_offset + token_idx, -float(k_value)) for token_idx in hitting_set)
+        violations.append((violation, full_key, entries, -rhs_value))
+
+    return violations
+
+
+def separate_group_value_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    seed_words: int = 120,
+    candidate_words: int = 1200,
+    group_words: int = 250,
+    max_rank: int = 8,
+):
+    """Separate small token-set lower-envelope cuts over groups of words.
+
+    For a selected token set S and a group of words G, define F(U) as the
+    minimum weighted token count on G when U subset S is active and every token
+    outside S is allowed. Any affine lower bound on F(U) is valid for integral
+    token activations, and can cut fractional solutions that combine
+    word-specific alternatives inconsistently.
+    """
+
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+    suspicious = rank_suspicious_words(lp, f_values, max_words=candidate_words)
+    suspicious_set = set(suspicious)
+    token_word_scores = defaultdict(list)
+    word_fractional_scores = {}
+
+    for word_idx in suspicious:
+        score = 0.0
+        by_token_score = defaultdict(float)
+        word_weight = float(lp["word_weights"][word_idx])
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            value = float(f_values[edge_idx])
+            if value <= tolerance:
+                continue
+            info = lp["nonfree_edge_info"][edge_idx]
+            token_idx = info["token_index"]
+            edge_score = value * max(1, info["end"] - info["start"])
+            by_token_score[token_idx] += edge_score
+            if tolerance < float(t_values[token_idx]) < 1.0 - tolerance:
+                score += min(value, 1.0 - value) * max(1, info["end"] - info["start"])
+        if score <= 0:
+            continue
+        word_fractional_scores[word_idx] = word_weight * score
+        for token_idx, token_score in by_token_score.items():
+            token_word_scores[token_idx].append((word_weight * token_score, word_idx))
+
+    for rows in token_word_scores.values():
+        rows.sort(reverse=True)
+
+    candidate_sets = []
+    for word_idx in suspicious[:seed_words]:
+        color_scores = defaultdict(float)
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            value = float(f_values[edge_idx])
+            if value <= tolerance:
+                continue
+            info = lp["nonfree_edge_info"][edge_idx]
+            token_idx = info["token_index"]
+            token_value = float(t_values[token_idx])
+            if tolerance < token_value < 1.0 - tolerance:
+                color_scores[token_idx] += value * max(1, info["end"] - info["start"])
+        selected = tuple(
+            token_idx
+            for token_idx, _ in sorted(color_scores.items(), key=lambda item: item[1], reverse=True)[:max_rank]
+        )
+        if len(selected) >= 2:
+            candidate_sets.append(selected)
+
+    seen_sets = set()
+    violations = []
+    for selected_tokens in candidate_sets:
+        selected_tokens = tuple(sorted(selected_tokens))
+        if selected_tokens in seen_sets:
+            continue
+        seen_sets.add(selected_tokens)
+        full_key_prefix = ("group_value", selected_tokens)
+        if any(key[:2] == full_key_prefix for key in existing_cut_keys):
+            continue
+
+        group_score = defaultdict(float)
+        for token_idx in selected_tokens:
+            for score, word_idx in token_word_scores.get(token_idx, [])[:group_words]:
+                if word_idx in suspicious_set:
+                    group_score[word_idx] += score
+        selected_words = tuple(
+            word_idx
+            for word_idx, _ in sorted(
+                group_score.items(),
+                key=lambda item: (item[1], word_fractional_scores.get(item[0], 0.0)),
+                reverse=True,
+            )[:group_words]
+        )
+        if not selected_words:
+            continue
+
+        current_cost = group_current_cost(lp, selected_words, f_values, g_values)
+        value_by_mask = group_value_function(lp, selected_words, selected_tokens)
+        bound = affine_lower_bound_for_values(value_by_mask, t_values, selected_tokens)
+        if bound is None:
+            continue
+        alpha, beta_values, rhs_at_current = bound
+        violation = rhs_at_current - current_cost
+        if violation <= tolerance:
+            continue
+
+        beta_key = tuple(round(float(beta), 8) for beta in beta_values)
+        full_key = (*full_key_prefix, selected_words, beta_key)
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        for word_idx in selected_words:
+            word_weight = float(lp["word_weights"][word_idx])
+            entries.extend((edge_idx, -word_weight) for edge_idx in lp["word_nonfree_edges"].get(word_idx, []))
+            entries.extend((num_f + edge_idx, -word_weight) for edge_idx in lp["word_free_edges"].get(word_idx, []))
+        entries.extend(
+            (t_offset + token_idx, float(beta))
+            for token_idx, beta in zip(selected_tokens, beta_values)
+            if abs(beta) > 1e-12
+        )
+        violations.append((violation, full_key, entries, -float(alpha)))
+
+    return violations
+
+
+def group_current_cost(lp, selected_words, f_values, g_values) -> float:
+    total = 0.0
+    for word_idx in selected_words:
+        word_weight = float(lp["word_weights"][word_idx])
+        nonfree_edges = lp["word_nonfree_edges"].get(word_idx, [])
+        free_edges = lp["word_free_edges"].get(word_idx, [])
+        total += word_weight * float(f_values[nonfree_edges].sum() + g_values[free_edges].sum())
+    return total
+
+
+def group_value_function(lp, selected_words, selected_tokens):
+    token_position = {token_idx: bit for bit, token_idx in enumerate(selected_tokens)}
+    values = {mask: 0.0 for mask in range(1 << len(selected_tokens))}
+    for mask in values:
+        for word_idx in selected_words:
+            values[mask] += float(lp["word_weights"][word_idx]) * word_shortest_path_cost(
+                lp,
+                word_idx,
+                token_position,
+                mask,
+            )
+    return values
+
+
+def word_shortest_path_cost(lp, word_idx: int, token_position: dict[int, int], mask: int) -> float:
+    by_start = defaultdict(list)
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        info = lp["nonfree_edge_info"][edge_idx]
+        token_idx = info["token_index"]
+        bit = token_position.get(token_idx)
+        if bit is None or (mask & (1 << bit)):
+            by_start[info["start"]].append(info["end"])
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        info = lp["free_edge_info"][edge_idx]
+        by_start[info["start"]].append(info["end"])
+
+    target = lp["word_lengths"][word_idx]
+    costs = [float("inf")] * (target + 1)
+    costs[0] = 0.0
+    for position in range(target):
+        if not np.isfinite(costs[position]):
+            continue
+        next_cost = costs[position] + 1.0
+        for end in by_start.get(position, []):
+            if end <= target and next_cost < costs[end]:
+                costs[end] = next_cost
+    return float(costs[target])
+
+
+def affine_lower_bound_for_values(values_by_mask, t_values, selected_tokens):
+    rank = len(selected_tokens)
+    objective = np.array([-1.0, *[-float(t_values[token_idx]) for token_idx in selected_tokens]])
+    a_ub = []
+    b_ub = []
+    for mask, value in values_by_mask.items():
+        row = [1.0]
+        for bit in range(rank):
+            row.append(1.0 if mask & (1 << bit) else 0.0)
+        a_ub.append(row)
+        b_ub.append(float(value))
+
+    result = linprog(
+        c=objective,
+        A_ub=np.array(a_ub, dtype=float),
+        b_ub=np.array(b_ub, dtype=float),
+        bounds=[(None, None)] * (rank + 1),
+        method="highs",
+    )
+    if not result.success:
+        return None
+    alpha = float(result.x[0])
+    beta_values = np.array(result.x[1:], dtype=float)
+    rhs_at_current = -float(result.fun)
+    return alpha, beta_values, rhs_at_current
+
+
 def enumerate_short_path_token_sets(lp, word_idx: int, max_length: int, *, max_paths: int):
     by_start = defaultdict(list)
     for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
@@ -1490,6 +1996,48 @@ def candidate_low_weight_hitting_sets(path_token_sets, t_values, *, max_hitting_
     if candidates:
         return candidates
     return []
+
+
+def exact_min_weight_hitting_set(path_token_sets, t_values, token_universe):
+    from scipy.optimize import Bounds, LinearConstraint, milp
+
+    token_position = {token_idx: idx for idx, token_idx in enumerate(token_universe)}
+    rows = []
+    cols = []
+    data = []
+    for row_idx, token_set in enumerate(path_token_sets):
+        for token_idx in token_set:
+            rows.append(row_idx)
+            cols.append(token_position[token_idx])
+            data.append(1.0)
+
+    if not rows:
+        return set()
+    constraint_matrix = sp.coo_matrix(
+        (data, (rows, cols)),
+        shape=(len(path_token_sets), len(token_universe)),
+        dtype=float,
+    ).tocsr()
+    constraints = LinearConstraint(
+        constraint_matrix,
+        lb=np.ones(len(path_token_sets), dtype=float),
+        ub=np.full(len(path_token_sets), np.inf, dtype=float),
+    )
+    objective = np.array([float(t_values[token_idx]) for token_idx in token_universe], dtype=float)
+    result = milp(
+        c=objective,
+        integrality=np.ones(len(token_universe), dtype=int),
+        bounds=Bounds(np.zeros(len(token_universe)), np.ones(len(token_universe))),
+        constraints=constraints,
+        options={"disp": False, "time_limit": 2.0},
+    )
+    if not result.success:
+        return set()
+    return {
+        token_idx
+        for token_idx, value in zip(token_universe, result.x)
+        if value > 0.5
+    }
 
 
 def greedy_low_density_multicover(path_token_sets, t_values):

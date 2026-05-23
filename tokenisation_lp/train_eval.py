@@ -198,7 +198,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Comma-separated LP cut families. Supported: "
             "boundary,word_packing,global_token_packing,global_pair_packing,global_triple_packing,"
-            "path_config,path_multicover,"
+            "global_rank_count,word_rank_count,word_rank_length,path_config,path_multicover,path_min_cover,group_value,"
             "window_overlap,window_overlap_deep,word_path_cover,window_pair."
         ),
     )

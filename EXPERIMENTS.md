@@ -491,3 +491,159 @@ uv run tokenizer-lp-train \
 | 1 | 0 | 0 | 258,417.000 | 268,378 | 3.7116% |
 
 The triple cut was violated at the base point but did not move the objective by itself.
+
+## Residual Fractionality and Additional Cut Search
+
+After adding the known valid same-colour byte-boundary and word-packing cuts on `~/Desktop/books`, the remaining solution is still highly fractional:
+
+| Quantity | Value |
+|---|---:|
+| LP bound | 258,420.750 tokens |
+| Positive token-selection variables | 399 |
+| Fractional token-selection variables | 288 |
+| Sum of token-selection variables | 254.000 |
+| Fractional non-free edge variables | 47,730 |
+| Fractional free edge variables | 20,820 |
+
+The fractional token values are almost entirely half-integral:
+
+| Fractional `t` value | Count |
+|---:|---:|
+| 0.50 | 278 |
+| 0.25 | 7 |
+| 0.75 | 3 |
+
+Representative high-weight residual words look like mixtures of two equally good segmentations:
+
+```text
+word='Ġthere', freq=205, cost=2.0
+  0.5 * ['Ġth', 'ere']  with t('Ġth')=1.0, t('ere')=0.5
+  0.5 * ['Ġthe', 're']  with t('Ġthe')=1.0, t('re')=0.5
+
+word='Ġyour', freq=240, cost=1.5
+  0.5 * ['Ġyou', 'r']   with t('Ġyou')=1.0, byte fallback 'r'
+  0.5 * ['Ġyour']       with t('Ġyour')=0.5
+```
+
+For a single word, these are not necessarily cuttable by a valid linear local inequality: the point can be a convex combination of two valid integral segmentations. This is why many local packing families either find nothing after the boundary cleanup or move only rounding/tie-breaking.
+
+### New Families Tried
+
+I implemented and tested these additional conservative families:
+
+- `word_rank_count`: full-word small-rank interval capacity using edge count.
+- `word_rank_length`: full-word small-rank interval capacity using covered byte length.
+- `global_rank_count`: weighted corpus-level small-rank count-capacity cuts.
+- `path_min_cover`: exact minimum-weight hitting-set version of the short-path cover cut.
+- `group_value`: small token-set lower-envelope cuts over groups of words. For a token set `S`, it computes `F(U)` as the minimum weighted token count with `U subset S` active and every token outside `S` allowed, then adds an affine lower bound on `F`. This is valid because allowing all outside tokens can only make the bound weaker.
+
+Separation at the base LP:
+
+| Family | Cuts Found | Max Violation |
+|---|---:|---:|
+| `boundary` | 23 | 0.5 |
+| `word_packing` | 3 | 1 |
+| `global_token_packing` | 1 | 25.5 |
+| `global_pair_packing` | 1 | 87 |
+| `global_triple_packing` | 1 | 15 |
+| `global_rank_count` | 2 | 10.5 |
+| `word_rank_count` | 0 | 0 |
+| `word_rank_length` | 2 | 1 |
+| `path_config` | 0 | 0 |
+| `path_multicover` | 0 | 0 |
+| `path_min_cover` | 0 | 0 |
+| `group_value` | 0 | 0 |
+| `window_overlap` | 12 | 1 |
+| `window_overlap_deep` | 42 | 1 |
+| `word_path_cover` | 0 | 0 |
+| `window_pair` | 12 | 1 |
+
+Separation after the 26 boundary + word-packing cleanup cuts:
+
+| Family | Cuts Found | Max Violation |
+|---|---:|---:|
+| all implemented families above | 0 | 0 |
+
+Bound-moving runs for the new families:
+
+| Family | Bound After Cuts | Bound Gain | Rounded Tokens | Notes |
+|---|---:|---:|---:|---|
+| `word_rank_count` | 258,417.000 | 0 | 268,378 | No cuts found at base. |
+| `word_rank_length` | 258,417.100 | +0.100 | 266,972 | Valid but only changes rounding/tie-breaking materially. |
+| `global_rank_count` | 258,417.000 | 0 | 268,378 | Two violated cuts, no objective movement. |
+| `path_min_cover` | 258,417.000 | 0 | 268,378 | No cuts found. |
+| `group_value` | 258,417.000 | 0 | 268,378 | No cuts found with rank-8 candidate sets. |
+| `boundary,word_packing,word_rank_length` | 258,420.750 | +3.750 | 268,378 | Same bound as boundary + word-packing alone. |
+
+The `word_rank_length` rounded result is not evidence of a stronger relaxation; the LP bound only improves by 0.100 token, so the rounded tokenizer changed because the tiny perturbation changed token ordering around fractional ties.
+
+### Validity Checks and Rejected Ideas
+
+The large-looking base violations for `global_pair_packing`, `global_rank_count`, and related cuts are not enough by themselves. After solving with the cuts, the bound movement is tiny or zero. I treated earlier big jumps as suspect until the formulas were checked against all binary activation subsets; the previous asymmetric pair formula and the old global pair bit-ordering bug were invalid and should remain discarded.
+
+The tempting "conflicting edges <= max(active colour)" cut is not useful as a linear LP cut in this formulation. For a clique of overlapping intervals, `sum f_e <= 1` is already implied by the word flow across the shared byte boundary. A max activation RHS would require an auxiliary `m = max(t_i)`. The convex linear relaxation has `m >= t_i`, and because `m` only appears on the RHS, the LP can raise `m` to satisfy the cut. Without a nonconvex equality or an objective penalty on `m`, it collapses to the existing boundary/flow information.
+
+The remaining gap appears to be a global decomposition issue: many words are locally convex combinations of valid paths, and the token budget polytope itself is integral, but the LP can use different fractional path mixtures for different words under the same half-integral token vector. Local interval-packing, same-colour, small-window, and small-rank value cuts do not detect an inconsistency after the boundary cleanup.
+
+Potential next directions that are more likely to tighten the relaxation:
+
+- **Global scenario/decomposition cuts:** try to prove that the current `(t, f)` cannot be decomposed into a convex combination of a small number of integral vocabularies and their induced shortest paths.
+- **Column-generation over vocabularies:** solve a master problem over integral token sets/tokenizers for the current fractional support; violated decomposition constraints would be directly meaningful.
+- **Larger group value cuts:** increase `group_value` rank and construct token sets by clustering half-integral tokens globally rather than seeding from one word. This is valid but may get expensive quickly.
+- **Branch-and-cut style local branching:** temporarily branch on a cluster of half-integral tokens, solve both child LPs, and derive disjunctive cuts if both children imply a higher bound. This is stronger than modular local cuts but substantially more complex.
+
+## Split Branching Bounds
+
+I added a diagnostic branch tool:
+
+```bash
+uv run tokenizer-lp-branch-split \
+  --data-dir ~/Desktop/books \
+  --vocab-size 512 \
+  --pretokenizer nanochat \
+  --min-token-count 5 \
+  --max-token-length 8 \
+  --cut-rounds 1 \
+  --cuts-per-round 500 \
+  --cut-families boundary,word_packing \
+  --max-candidates 30 \
+  --max-nodes 40 \
+  --max-depth 3 \
+  --incumbent-tokens 266972
+```
+
+The tool starts from a live HiGHS basis, adds the cleanup cuts, and then changes token activation bounds in place. For a binary token variable `t_i`, the split disjunction is:
+
+```text
+t_i = 0  OR  t_i = 1
+```
+
+If the child LP bounds are `L0` and `L1`, then every integral tokenizer must have objective at least `min(L0, L1)`. Equivalently, the branch proof can add the ILP-valid objective cutoff:
+
+```text
+c^T x >= min(L0, L1)
+```
+
+This is not a local packing inequality, but it is a valid split cut for the integer problem.
+
+Book run results:
+
+| Bound Source | Certified Bound | Gain vs Cleanup LP |
+|---|---:|---:|
+| Cleanup LP (`boundary,word_packing`) | 258,420.750 | 0 |
+| Best one-token split | 258,550.000 | +129.250 |
+| Depth-3 adaptive split tree | 258,698.500 | +277.750 |
+
+Best one-token splits from the 30-token sweep:
+
+| Token | Root `t` | Child `t=0` Bound | Child `t=1` Bound | Split Bound |
+|---|---:|---:|---:|---:|
+| `me` | 0.5 | 258,598.750 | 258,550.000 | 258,550.000 |
+| `hi` | 0.5 | 258,637.500 | 258,542.500 | 258,542.500 |
+| `ou` | 0.5 | 258,562.250 | 258,535.250 | 258,535.250 |
+| `ng` | 0.5 | 258,530.750 | 258,535.500 | 258,530.750 |
+| `Ġm` | 0.5 | 258,864.000 | 258,525.000 | 258,525.000 |
+
+The shallow branch tree branched adaptively on high-impact fractional tokens and fully closed the depth-3 tree in this run. The correct certified bound is the minimum leaf bound, not the maximum leaf bound; an earlier smoke check caught this reporting pitfall. The depth-3 result therefore certifies `258,698.500`, not the largest observed leaf bound.
+
+This is the first tested direction after the local cuts that materially tightens the bound. It supports the diagnosis that the remaining relaxation gap is mostly token-activation integrality, not missing local interval packing.

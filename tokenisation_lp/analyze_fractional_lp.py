@@ -5,10 +5,9 @@ import logging
 from collections import defaultdict
 
 import numpy as np
-from scipy.optimize import linprog
-
 from tokenisation_lp.corpus import load_texts
 from tokenisation_lp.lp_training import (
+    HighsWarmLpSolver,
     build_standard_form,
     count_pretokenized_strings,
     separate_cuts,
@@ -50,6 +49,17 @@ def parse_args() -> argparse.Namespace:
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+    )
+    parser.add_argument(
+        "--lp-solution-cache-dir",
+        default=None,
+        help="Optional directory for caching identical LP solutions.",
+    )
+    parser.add_argument(
+        "--lp-solver",
+        choices=("highspy",),
+        default="highspy",
+        help="Diagnostic solver backend.",
     )
     return parser.parse_args()
 
@@ -93,18 +103,20 @@ def main() -> None:
         token_budget,
     )
     a_ub = lp["A_ub"]
+    solver = HighsWarmLpSolver(
+        c=lp["c"],
+        A_ub=a_ub,
+        b_ub=b_ub,
+        A_eq=lp["A_eq"],
+        b_eq=lp["b_eq"],
+        lb=lp["lb"],
+        ub=lp["ub"],
+        cache_dir=args.lp_solution_cache_dir,
+    )
     existing_cut_keys = set()
     solution = None
     for iteration in range(args.cut_rounds + 1):
-        solution = linprog(
-            c=lp["c"],
-            A_ub=a_ub,
-            b_ub=b_ub,
-            A_eq=lp["A_eq"],
-            b_eq=lp["b_eq"],
-            bounds=list(zip(lp["lb"], lp["ub"])),
-            method="highs",
-        )
+        solution = solver.solve()
         if not solution.success:
             raise RuntimeError(f"LP solve failed: {solution.message}")
 
@@ -129,8 +141,7 @@ def main() -> None:
         if not cut_keys:
             break
         existing_cut_keys.update(cut_keys)
-        a_ub = stack_ub(a_ub, cut_matrix)
-        b_ub = np.concatenate([b_ub, cut_rhs])
+        solver.add_ub_rows(cut_matrix, cut_rhs)
 
     if solution is None:
         raise RuntimeError("LP was not solved")
@@ -139,12 +150,6 @@ def main() -> None:
 
     LOGGER.info("Final diagnostic LP includes %d added cuts", len(existing_cut_keys))
     analyze_solution(args, lp, solution.x, tokens, words)
-
-
-def stack_ub(a_ub, cut_matrix):
-    import scipy.sparse as sp
-
-    return sp.vstack([a_ub, cut_matrix], format="csr")
 
 
 def analyze_solution(args, lp, x_values, tokens, words) -> None:
