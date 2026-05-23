@@ -16,7 +16,9 @@ uv run tokenizer-lp-train \
   --vocab-size 8192 \
   --kind lp \
   --lp-cut-rounds 5 \
-  --lp-cuts-per-round 500
+  --lp-cuts-per-round 500 \
+  --lp-cut-families boundary,word_packing,global_token_packing,global_pair_packing,path_config,path_multicover,window_overlap,window_overlap_deep,window_pair \
+  --lp-solution-cache-dir /tmp/tokenizer_lp_solution_cache
 ```
 
 Each LP iteration logs the relaxed token lower bound, its implied bytes/token upper bound, and the rounded DP tokenizer compression rate.

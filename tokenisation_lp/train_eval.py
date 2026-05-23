@@ -27,6 +27,8 @@ def train_and_eval_lp(
     cut_rounds: int,
     cuts_per_round: int,
     cut_tolerance: float,
+    cut_families: tuple[str, ...],
+    lp_solution_cache_dir: str | None,
 ):
     saw_iteration = False
 
@@ -69,6 +71,8 @@ def train_and_eval_lp(
         cut_rounds=cut_rounds,
         cuts_per_round=cuts_per_round,
         cut_tolerance=cut_tolerance,
+        cut_families=cut_families,
+        lp_solution_cache_dir=lp_solution_cache_dir,
         iteration_callback=on_iteration,
     )
     if not saw_iteration:
@@ -186,6 +190,21 @@ def parse_args() -> argparse.Namespace:
         default=1e-6,
         help="Minimum violation required to add a byte-boundary cut.",
     )
+    parser.add_argument(
+        "--lp-cut-families",
+        default="boundary",
+        help=(
+            "Comma-separated LP cut families. Supported: "
+            "boundary,word_packing,global_token_packing,global_pair_packing,global_triple_packing,"
+            "path_config,path_multicover,"
+            "window_overlap,window_overlap_deep,word_path_cover,window_pair."
+        ),
+    )
+    parser.add_argument(
+        "--lp-solution-cache-dir",
+        default=None,
+        help="Optional directory for caching identical SciPy HiGHS LP solutions, e.g. /tmp/tokenizer_lp_cache.",
+    )
     return parser.parse_args()
 
 
@@ -204,6 +223,11 @@ def main() -> None:
         len(train_texts),
         len(eval_texts),
     )
+    cut_families = tuple(
+        family.strip()
+        for family in args.lp_cut_families.split(",")
+        if family.strip()
+    )
 
     if args.kind in {"lp", "both"}:
         train_and_eval_lp(
@@ -218,6 +242,8 @@ def main() -> None:
             cut_rounds=args.lp_cut_rounds,
             cuts_per_round=args.lp_cuts_per_round,
             cut_tolerance=args.lp_cut_tolerance,
+            cut_families=cut_families,
+            lp_solution_cache_dir=args.lp_solution_cache_dir,
         )
 
     if args.kind in {"bpe", "both"}:
