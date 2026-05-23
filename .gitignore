@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local/generated training artifacts.
+tokenizer_runs/
+tokenisation_lp/.git/
+tokenisation_lp/bpe_tokenizers_climbmix/
+tokenisation_lp/rounded_tokenizers/
+tokenisation_lp/pythia-70m-deduped/
+tokenisation_lp/strings_with_frequency.npz
+tokenisation_lp/tinystories_data/
+tokenisation_lp/vocabs/
+tokenisation_lp/tokenizers_jsons/
+tokenisation_lp/lp_tokenizer/memory_usage/
+tokenisation_lp/new_tokenizers/
+tokenisation_lp/lp_tokenizer/finewebedu_data/
+tokenisation_lp/word_freqs*.npy
+tokenisation_lp/unique*.npy
+tokenisation_lp/tokenized_dataset/
+tokenisation_lp/downloaded_parquet_samples/
+

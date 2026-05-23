@@ -1,0 +1,26 @@
+[project]
+name = "tokenizer-lp"
+version = "0.1.0"
+description = "CPU LP and greedy BPE tokenizer training utilities"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "tokenizers>=0.19",
+]
+
+[project.scripts]
+tokenizer-lp-train = "tokenisation_lp.train_eval:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tokenisation_lp"]
+exclude = [
+    "tokenisation_lp/.git/**",
+    "tokenisation_lp/bpe_tokenizers_climbmix/**",
+    "tokenisation_lp/rounded_tokenizers/**",
+]
