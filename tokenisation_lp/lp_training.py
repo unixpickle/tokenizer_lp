@@ -70,6 +70,7 @@ def train_lp_tokenizer(
     cut_tolerance: float = 1e-6,
     cut_families: tuple[str, ...] = ("boundary",),
     lp_solution_cache_dir: str | Path | None = None,
+    lp_solver: str = "highspy",
     iteration_callback: Callable[[LpSolveIteration, LpDpTokenizer], None] | None = None,
 ) -> LpTrainingResult:
     special_tokens = list(special_tokens or DEFAULT_SPECIAL_TOKENS)
@@ -112,6 +113,7 @@ def train_lp_tokenizer(
         cut_tolerance=cut_tolerance,
         cut_families=cut_families,
         lp_solution_cache_dir=lp_solution_cache_dir,
+        lp_solver=lp_solver,
         iteration_callback=handle_iteration,
     )
     selected_candidates = round_lp_tokens(candidates, multi_token_budget, excluded=set(base_vocab))
@@ -164,6 +166,7 @@ def solve_lp_vocabulary(
     cut_tolerance: float = 1e-6,
     cut_families: tuple[str, ...] = ("boundary",),
     lp_solution_cache_dir: str | Path | None = None,
+    lp_solver: str = "highspy",
     iteration_callback: Callable[[LpSolveIteration], None] | None = None,
 ) -> CandidateList:
     if num_allowed_tokens <= 0:
@@ -205,21 +208,38 @@ def solve_lp_vocabulary(
     existing_cut_keys: set[tuple[int, int, int]] = set()
     iterations: list[LpSolveIteration] = []
     final_candidates = CandidateList()
-
-    for iteration in range(cut_rounds + 1):
-        start = time.monotonic()
-        solution = solve_linprog_cached(
+    highs_solver = None
+    if lp_solver == "highspy":
+        highs_solver = HighsWarmLpSolver(
             c=lp["c"],
             A_ub=a_ub,
             b_ub=b_ub,
             A_eq=lp["A_eq"],
             b_eq=lp["b_eq"],
-            bounds=list(zip(lp["lb"], lp["ub"])),
+            lb=lp["lb"],
+            ub=lp["ub"],
             cache_dir=lp_solution_cache_dir,
         )
+    elif lp_solver != "scipy":
+        raise ValueError(f"Unsupported LP solver {lp_solver!r}. Expected 'highspy' or 'scipy'.")
+
+    for iteration in range(cut_rounds + 1):
+        start = time.monotonic()
+        if highs_solver is not None:
+            solution = highs_solver.solve()
+        else:
+            solution = solve_linprog_cached(
+                c=lp["c"],
+                A_ub=a_ub,
+                b_ub=b_ub,
+                A_eq=lp["A_eq"],
+                b_eq=lp["b_eq"],
+                bounds=list(zip(lp["lb"], lp["ub"])),
+                cache_dir=lp_solution_cache_dir,
+            )
         solve_seconds = time.monotonic() - start
         if not solution.success:
-            raise RuntimeError(f"SciPy HiGHS LP solve failed: {solution.message}")
+            raise RuntimeError(f"LP solve failed with {lp_solver}: {solution.message}")
 
         candidates = candidates_from_solution(tokens, lp, solution.x)
         candidates.objective_value = float(solution.fun)
@@ -273,8 +293,11 @@ def solve_lp_vocabulary(
             break
 
         existing_cut_keys.update(cut_keys)
-        a_ub = sp.vstack([a_ub, cut_matrix], format="csr")
-        b_ub = np.concatenate([b_ub, cut_rhs])
+        if highs_solver is not None:
+            highs_solver.add_ub_rows(cut_matrix, cut_rhs)
+        else:
+            a_ub = sp.vstack([a_ub, cut_matrix], format="csr")
+            b_ub = np.concatenate([b_ub, cut_rhs])
 
     final_candidates.iterations = iterations
     return final_candidates
@@ -342,6 +365,167 @@ def solve_linprog_cached(*, c, A_ub, b_ub, A_eq, b_eq, bounds, cache_dir=None):
         )
         LOGGER.info("Saved LP solution cache entry: %s", solution_path)
     return solution
+
+
+class HighsWarmLpSolver:
+    """Thin HiGHS wrapper that keeps one model alive as cut rows are added."""
+
+    def __init__(
+        self,
+        *,
+        c,
+        A_ub,
+        b_ub,
+        A_eq,
+        b_eq,
+        lb,
+        ub,
+        cache_dir=None,
+    ):
+        import highspy
+
+        self.highspy = highspy
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.c = np.asarray(c, dtype=float)
+        self.A_ub = A_ub.tocsr()
+        self.b_ub = np.asarray(b_ub, dtype=float)
+        self.A_eq = A_eq.tocsr()
+        self.b_eq = np.asarray(b_eq, dtype=float)
+        self.lb = np.asarray(lb, dtype=float)
+        self.ub = np.asarray(ub, dtype=float)
+        self.bounds = list(zip(self.lb, self.ub))
+
+        self.highs = highspy.Highs()
+        self.highs.setOptionValue("output_flag", False)
+        self.highs.setOptionValue("solver", "simplex")
+        self.highs.setOptionValue("simplex_strategy", 1)
+        self.highs.setOptionValue("presolve", "off")
+        self.highs.passModel(self._build_model())
+
+    def solve(self):
+        cached = self._load_cache()
+        if cached is not None:
+            return cached
+
+        self.highs.run()
+        model_status = self.highs.getModelStatus()
+        success = model_status == self.highspy.HighsModelStatus.kOptimal
+        message = self.highs.modelStatusToString(model_status)
+        if not success:
+            return SimpleNamespace(success=False, x=None, fun=float("nan"), message=message)
+
+        solution = self.highs.getSolution()
+        x_values = np.array(solution.col_value, dtype=float)
+        objective = float(self.highs.getObjectiveValue())
+        result = SimpleNamespace(
+            success=True,
+            x=x_values,
+            fun=objective,
+            message=message,
+        )
+        self._save_cache(result)
+        return result
+
+    def add_ub_rows(self, A_rows, b_rows) -> None:
+        if A_rows is None:
+            return
+        A_rows = A_rows.tocsr()
+        b_rows = np.asarray(b_rows, dtype=float)
+        if A_rows.shape[1] != self.c.shape[0]:
+            raise ValueError(
+                f"Cut matrix has {A_rows.shape[1]} columns, expected {self.c.shape[0]}."
+            )
+        if A_rows.shape[0] != b_rows.shape[0]:
+            raise ValueError("Cut matrix row count must match cut RHS length.")
+        if A_rows.shape[0] == 0:
+            return
+
+        row_lower = np.full(A_rows.shape[0], -self.highspy.kHighsInf, dtype=float)
+        row_upper = b_rows.astype(float, copy=False)
+        self.highs.addRows(
+            A_rows.shape[0],
+            row_lower,
+            row_upper,
+            A_rows.nnz,
+            A_rows.indptr.astype(np.int32, copy=False),
+            A_rows.indices.astype(np.int32, copy=False),
+            A_rows.data.astype(float, copy=False),
+        )
+        self.A_ub = sp.vstack([self.A_ub, A_rows], format="csr")
+        self.b_ub = np.concatenate([self.b_ub, b_rows])
+
+    def _build_model(self):
+        highspy = self.highspy
+        constraint_matrix = sp.vstack([self.A_eq, self.A_ub], format="csr")
+        row_lower = np.concatenate(
+            [
+                self.b_eq,
+                np.full(self.A_ub.shape[0], -highspy.kHighsInf, dtype=float),
+            ]
+        )
+        row_upper = np.concatenate([self.b_eq, self.b_ub])
+
+        matrix = highspy.HighsSparseMatrix()
+        matrix.num_col_ = int(constraint_matrix.shape[1])
+        matrix.num_row_ = int(constraint_matrix.shape[0])
+        matrix.format_ = highspy.MatrixFormat.kRowwise
+        matrix.start_ = constraint_matrix.indptr.astype(np.int32, copy=False)
+        matrix.p_end_ = np.array([], dtype=np.int32)
+        matrix.index_ = constraint_matrix.indices.astype(np.int32, copy=False)
+        matrix.value_ = constraint_matrix.data.astype(float, copy=False)
+
+        lp = highspy.HighsLp()
+        lp.num_col_ = int(self.c.shape[0])
+        lp.num_row_ = int(constraint_matrix.shape[0])
+        lp.col_cost_ = self.c
+        lp.col_lower_ = self.lb
+        lp.col_upper_ = self.ub
+        lp.row_lower_ = row_lower
+        lp.row_upper_ = row_upper
+        lp.a_matrix_ = matrix
+        lp.sense_ = highspy.ObjSense.kMinimize
+        lp.offset_ = 0.0
+        return lp
+
+    def _cache_path(self) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        key = lp_cache_key(
+            c=self.c,
+            A_ub=self.A_ub,
+            b_ub=self.b_ub,
+            A_eq=self.A_eq,
+            b_eq=self.b_eq,
+            bounds=self.bounds,
+        )
+        return self.cache_dir / f"{key}.npz"
+
+    def _load_cache(self):
+        solution_path = self._cache_path()
+        if solution_path is None or not solution_path.exists():
+            return None
+        cached = np.load(solution_path, allow_pickle=False)
+        LOGGER.info("Loaded LP solution cache hit: %s", solution_path)
+        return SimpleNamespace(
+            success=bool(cached["success"]),
+            x=cached["x"],
+            fun=float(cached["fun"]),
+            message=str(cached["message"]),
+        )
+
+    def _save_cache(self, solution) -> None:
+        solution_path = self._cache_path()
+        if solution_path is None or not solution.success:
+            return
+        solution_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            solution_path,
+            success=np.array(solution.success),
+            x=solution.x,
+            fun=np.array(solution.fun, dtype=float),
+            message=np.array(str(solution.message)),
+        )
+        LOGGER.info("Saved LP solution cache entry: %s", solution_path)
 
 
 def lp_cache_key(*, c, A_ub, b_ub, A_eq, b_eq, bounds) -> str:

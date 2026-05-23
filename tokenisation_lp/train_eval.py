@@ -29,6 +29,7 @@ def train_and_eval_lp(
     cut_tolerance: float,
     cut_families: tuple[str, ...],
     lp_solution_cache_dir: str | None,
+    lp_solver: str,
 ):
     saw_iteration = False
 
@@ -73,6 +74,7 @@ def train_and_eval_lp(
         cut_tolerance=cut_tolerance,
         cut_families=cut_families,
         lp_solution_cache_dir=lp_solution_cache_dir,
+        lp_solver=lp_solver,
         iteration_callback=on_iteration,
     )
     if not saw_iteration:
@@ -203,7 +205,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lp-solution-cache-dir",
         default=None,
-        help="Optional directory for caching identical SciPy HiGHS LP solutions, e.g. /tmp/tokenizer_lp_cache.",
+        help="Optional directory for caching identical LP solutions, e.g. /tmp/tokenizer_lp_cache.",
+    )
+    parser.add_argument(
+        "--lp-solver",
+        choices=("highspy", "scipy"),
+        default="highspy",
+        help="LP solver backend. highspy keeps a simplex model alive for iterative cut warm starts.",
     )
     return parser.parse_args()
 
@@ -244,6 +252,7 @@ def main() -> None:
             cut_tolerance=args.lp_cut_tolerance,
             cut_families=cut_families,
             lp_solution_cache_dir=args.lp_solution_cache_dir,
+            lp_solver=args.lp_solver,
         )
 
     if args.kind in {"bpe", "both"}:
