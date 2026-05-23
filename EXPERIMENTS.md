@@ -647,3 +647,83 @@ Best one-token splits from the 30-token sweep:
 The shallow branch tree branched adaptively on high-impact fractional tokens and fully closed the depth-3 tree in this run. The correct certified bound is the minimum leaf bound, not the maximum leaf bound; an earlier smoke check caught this reporting pitfall. The depth-3 result therefore certifies `258,698.500`, not the largest observed leaf bound.
 
 This is the first tested direction after the local cuts that materially tightens the bound. It supports the diagnosis that the remaining relaxation gap is mostly token-activation integrality, not missing local interval packing.
+
+## Conflict Clique and Odd-Cycle Cuts
+
+I also tested clique and odd-cycle cuts of the form:
+
+```text
+sum_{e in clique} x_e <= 1
+sum_{e in odd cycle C} x_e <= floor(|C| / 2)
+```
+
+The safe conflict graph here is the per-word interval conflict graph: vertices are concrete token/free-byte interval edges in one pretokenized word, and two vertices conflict when their spans overlap. This is valid because an integral segmentation path can only use non-overlapping intervals.
+
+I did **not** apply these cuts directly to token colours globally. Two token colours are generally allowed to coexist in the same vocabulary, so a global token-colour conflict graph would not be ILP-valid without an additional disjunctive proof.
+
+Book separation result:
+
+| LP Point | Family | Cuts Found | Max Violation |
+|---|---|---:|---:|
+| Base LP | `conflict_clique` | 0 | 0 |
+| Base LP | `conflict_odd_cycle` | 0 | 0 |
+| Base LP | `boundary,word_packing` | 26 | 1 |
+| After boundary + word-packing cleanup | `conflict_clique` | 0 | 0 |
+| After boundary + word-packing cleanup | `conflict_odd_cycle` | 0 | 0 |
+
+This matches the structure of interval graphs. Pairwise overlap graphs of intervals are perfect, so odd-cycle inequalities are implied by clique inequalities. The clique inequalities themselves are already implied by the word flow constraints: every complete path crosses each byte boundary exactly once, so the sum of all interval-edge flow crossing a boundary is already at most/equal to one. The half-integral residual is therefore not an uncut stable-set odd-cycle artifact in the edge-overlap graph.
+
+Conclusion: clique/odd-cycle cuts are valid in the edge-conflict graph, but redundant for this LP. The useful “odd-cycle-like” phenomenon appears to live in token activation/disjunction space, which is why explicit split branching tightened the bound while local conflict graph cuts did not.
+
+## Word Segmentation-Support Cuts
+
+I tested a path-mixture version of the proposed repeated-word support idea.
+
+For one repeated word type `w`, enumerate every segmentation path `p` when the
+path count is small enough. For a selected token-colour set `S`, each path has
+a required support value:
+
+```text
+r(p) = |R(p) cap S|
+```
+
+where `R(p)` is the set of non-free token colours used by `p`. In any integral
+tokenizer using path `p`:
+
+```text
+r(p) <= sum_{tau in S} t_tau
+```
+
+To project this to the existing edge-flow variables, solve the small dual:
+
+```text
+max   y · f_w + gamma
+s.t.  y · incidence(p) + gamma <= r(p)   for every segmentation path p of w
+```
+
+Any feasible dual solution gives the valid cut:
+
+```text
+y · f_w + gamma <= sum_{tau in S} t_tau
+```
+
+The separator only emits a cut if all segmentations of the word were enumerated
+exactly. This avoids the common invalid shortcut where a cut is generated from
+an incomplete path list.
+
+Book results:
+
+| Cut Families | Final Bound | Gain vs Base | Gain vs Boundary Cleanup | Rounded Tokens |
+|---|---:|---:|---:|---:|
+| `word_support` | 258,417.750 | +0.750 | n/a | 268,378 |
+| `boundary,word_packing` | 258,420.750 | +3.750 | 0 | 268,378 |
+| `boundary,word_packing,word_support` | 258,421.500 | +4.500 | +0.750 | 268,378 |
+
+Separated support cuts:
+
+| LP Point | Cuts Found | Max Violation | Example Words |
+|---|---:|---:|---|
+| Base LP | 5 | 0.5 | `Ġsentence`, `Ġsentences`, `Ġindependent`, `Ġoptimistic`, `Ġfurniture` |
+| After boundary + word-packing cleanup | 2 | 0.5 | `Ġoptimistic`, `Ġfurniture` |
+
+This family is valid and matches the intended “average segmentation mixture needs enough colour support” idea. On this corpus it is real but weak: it adds another `+0.750` tokens to the relaxed bound after cleanup. The useful cuts came from relatively low-frequency repeated words, so the objective movement is small.

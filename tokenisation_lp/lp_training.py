@@ -718,6 +718,37 @@ def separate_cuts(
                 tolerance=tolerance,
             )
         )
+    if "conflict_clique" in family_set:
+        violations.extend(
+            separate_conflict_clique_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
+    if "conflict_odd_cycle" in family_set:
+        violations.extend(
+            separate_conflict_odd_cycle_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
+    if "word_support" in family_set:
+        violations.extend(
+            separate_word_support_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
     if "window_overlap" in family_set:
         violations.extend(
             separate_window_overlap_cut_specs(
@@ -1427,6 +1458,10 @@ def interval_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
     return max(0, min(a_end, b_end) - max(a_start, b_start))
 
 
+def intervals_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    return a_start < b_end and b_start < a_end
+
+
 def separate_path_config_cut_specs(
     lp,
     f_values,
@@ -1844,6 +1879,381 @@ def separate_group_value_cut_specs(
         violations.append((violation, full_key, entries, -float(alpha)))
 
     return violations
+
+
+def separate_conflict_clique_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 2000,
+):
+    """Separate interval-conflict clique cuts within words.
+
+    A tokenizer path can use at most one interval edge crossing any byte
+    boundary. These cuts are valid but should usually be implied by the word
+    flow conservation equations; the separator is useful as a sanity check.
+    """
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    suspicious_words = rank_suspicious_words(lp, f_values, max_words=max_words)
+    if not suspicious_words:
+        suspicious_words = range(len(lp["word_lengths"]))
+
+    for word_idx in suspicious_words:
+        word_len = lp["word_lengths"][word_idx]
+        for boundary in range(word_len):
+            full_key = ("conflict_clique", word_idx, boundary)
+            if full_key in existing_cut_keys:
+                continue
+            entries = []
+            lhs_value = 0.0
+            for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+                info = lp["nonfree_edge_info"][edge_idx]
+                if info["start"] <= boundary < info["end"]:
+                    entries.append((edge_idx, 1.0))
+                    lhs_value += float(f_values[edge_idx])
+            for edge_idx in lp["word_free_edges"].get(word_idx, []):
+                info = lp["free_edge_info"][edge_idx]
+                if info["start"] <= boundary < info["end"]:
+                    entries.append((num_f + edge_idx, 1.0))
+                    lhs_value += float(g_values[edge_idx])
+            violation = lhs_value - 1.0
+            if violation > tolerance:
+                violations.append((violation, full_key, entries, 1.0))
+
+    return violations
+
+
+def separate_conflict_odd_cycle_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 500,
+    max_vertices: int = 80,
+    max_cycle_len: int = 11,
+):
+    """Separate odd-cycle cuts in the per-word interval conflict graph.
+
+    Vertices are concrete token/free-byte interval edges in a single word. Two
+    vertices conflict if their spans overlap. In any integral segmentation, the
+    chosen intervals form a stable set, so for every odd cycle C:
+
+        sum_{e in C} x_e <= floor(|C| / 2)
+    """
+
+    violations = []
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        vertices = conflict_vertices_for_word(
+            lp,
+            f_values,
+            g_values,
+            word_idx,
+            max_vertices=max_vertices,
+            tolerance=tolerance,
+        )
+        if len(vertices) < 5:
+            continue
+        adjacency = build_interval_conflict_adjacency(vertices)
+        for cycle in find_odd_cycles(adjacency, max_cycle_len=max_cycle_len):
+            columns = tuple(sorted(vertices[idx]["col"] for idx in cycle))
+            full_key = ("conflict_odd_cycle", word_idx, columns)
+            if full_key in existing_cut_keys:
+                continue
+            lhs_value = sum(vertices[idx]["value"] for idx in cycle)
+            rhs_value = len(cycle) // 2
+            violation = lhs_value - rhs_value
+            if violation <= tolerance:
+                continue
+            entries = [(vertices[idx]["col"], 1.0) for idx in cycle]
+            violations.append((violation, full_key, entries, float(rhs_value)))
+
+    return violations
+
+
+def separate_word_support_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 2000,
+    max_rank: int = 20,
+    max_paths: int = 100000,
+):
+    """Separate exact word segmentation support cuts.
+
+    For a word and selected token colours S, every segmentation path p satisfies:
+
+        dual_edge_sum(p) + gamma <= |R(p) cap S|
+
+    Since all colours in R(p) must be active in any integral tokenizer using p,
+    the projected inequality
+
+        dual_edge_sum(flow_w) + gamma <= sum_{tau in S} t_tau
+
+    is ILP-valid. We only emit cuts when all segmentations of the word were
+    enumerated, so the dual constraints cover the full path set.
+    """
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        if lp["word_weights"][word_idx] <= 1:
+            continue
+        selected_tokens = word_support_selected_tokens(
+            lp,
+            f_values,
+            t_values,
+            word_idx,
+            max_rank=max_rank,
+            tolerance=tolerance,
+        )
+        if len(selected_tokens) < 2:
+            continue
+        full_key_prefix = ("word_support", word_idx, selected_tokens)
+        if any(key[:3] == full_key_prefix for key in existing_cut_keys):
+            continue
+
+        paths = enumerate_word_edge_paths(lp, word_idx, max_paths=max_paths)
+        if paths is None or len(paths) < 2:
+            continue
+        cut = word_support_cut_from_paths(
+            lp,
+            f_values,
+            g_values,
+            t_values,
+            word_idx,
+            selected_tokens,
+            paths,
+            tolerance=tolerance,
+        )
+        if cut is None:
+            continue
+        violation, edge_coefficients, token_coefficients, rhs, gamma = cut
+        gamma_key = round(float(gamma), 8)
+        full_key = (*full_key_prefix, gamma_key)
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        entries.extend((col_idx, coefficient) for col_idx, coefficient in edge_coefficients.items())
+        entries.extend(
+            (t_offset + token_idx, coefficient)
+            for token_idx, coefficient in token_coefficients.items()
+        )
+        violations.append((violation, full_key, entries, rhs))
+
+    return violations
+
+
+def word_support_selected_tokens(lp, f_values, t_values, word_idx: int, *, max_rank: int, tolerance: float):
+    scores = defaultdict(float)
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        value = float(f_values[edge_idx])
+        if value <= tolerance:
+            continue
+        info = lp["nonfree_edge_info"][edge_idx]
+        token_idx = info["token_index"]
+        token_value = float(t_values[token_idx])
+        if tolerance < token_value < 1.0 - tolerance:
+            scores[token_idx] += value * max(1, info["end"] - info["start"])
+    selected = [
+        token_idx
+        for token_idx, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:max_rank]
+    ]
+    return tuple(sorted(selected))
+
+
+def enumerate_word_edge_paths(lp, word_idx: int, *, max_paths: int):
+    num_f = lp["num_nonfree_edges"]
+    by_start = defaultdict(list)
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        info = lp["nonfree_edge_info"][edge_idx]
+        by_start[info["start"]].append((info["end"], edge_idx, info["token_index"]))
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        info = lp["free_edge_info"][edge_idx]
+        by_start[info["start"]].append((info["end"], num_f + edge_idx, None))
+
+    target = lp["word_lengths"][word_idx]
+    paths = []
+
+    def visit(position: int, columns: tuple[int, ...], token_set: frozenset[int]):
+        if len(paths) > max_paths:
+            return
+        if position == target:
+            paths.append((columns, token_set))
+            return
+        for end, col_idx, token_idx in by_start.get(position, []):
+            next_set = token_set if token_idx is None else token_set | frozenset((token_idx,))
+            visit(end, (*columns, col_idx), next_set)
+
+    visit(0, tuple(), frozenset())
+    if len(paths) > max_paths:
+        return None
+    return paths
+
+
+def word_support_cut_from_paths(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    word_idx: int,
+    selected_tokens: tuple[int, ...],
+    paths,
+    *,
+    tolerance: float,
+):
+    num_f = lp["num_nonfree_edges"]
+    selected_set = set(selected_tokens)
+    word_columns = []
+    current_values = []
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        word_columns.append(edge_idx)
+        current_values.append(float(f_values[edge_idx]))
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        word_columns.append(num_f + edge_idx)
+        current_values.append(float(g_values[edge_idx]))
+    col_position = {col_idx: idx for idx, col_idx in enumerate(word_columns)}
+
+    num_dual_vars = len(word_columns) + 1
+    rows = []
+    cols = []
+    data = []
+    rhs = []
+    for row_idx, (path_columns, path_tokens) in enumerate(paths):
+        for col_idx in path_columns:
+            rows.append(row_idx)
+            cols.append(col_position[col_idx])
+            data.append(1.0)
+        rows.append(row_idx)
+        cols.append(len(word_columns))
+        data.append(1.0)
+        rhs.append(float(len(path_tokens & selected_set)))
+
+    constraints = sp.coo_matrix(
+        (data, (rows, cols)),
+        shape=(len(paths), num_dual_vars),
+        dtype=float,
+    ).tocsr()
+    objective = -np.array([*current_values, 1.0], dtype=float)
+    result = linprog(
+        c=objective,
+        A_ub=constraints,
+        b_ub=np.array(rhs, dtype=float),
+        bounds=[(None, None)] * num_dual_vars,
+        method="highs",
+    )
+    if not result.success:
+        return None
+
+    dual_value = -float(result.fun)
+    support_value = float(t_values[list(selected_tokens)].sum())
+    violation = dual_value - support_value
+    if violation <= tolerance:
+        return None
+
+    edge_coefficients = {
+        col_idx: float(coefficient)
+        for col_idx, coefficient in zip(word_columns, result.x[: len(word_columns)])
+        if abs(coefficient) > 1e-10
+    }
+    token_coefficients = {token_idx: -1.0 for token_idx in selected_tokens}
+    gamma = float(result.x[-1])
+    rhs_value = -gamma
+    return violation, edge_coefficients, token_coefficients, rhs_value, gamma
+
+
+def conflict_vertices_for_word(lp, f_values, g_values, word_idx: int, *, max_vertices: int, tolerance: float):
+    num_f = lp["num_nonfree_edges"]
+    vertices = []
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        value = float(f_values[edge_idx])
+        if value <= tolerance:
+            continue
+        info = lp["nonfree_edge_info"][edge_idx]
+        vertices.append(
+            {
+                "col": edge_idx,
+                "value": value,
+                "start": info["start"],
+                "end": info["end"],
+            }
+        )
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        value = float(g_values[edge_idx])
+        if value <= tolerance:
+            continue
+        info = lp["free_edge_info"][edge_idx]
+        vertices.append(
+            {
+                "col": num_f + edge_idx,
+                "value": value,
+                "start": info["start"],
+                "end": info["end"],
+            }
+        )
+    vertices.sort(key=lambda item: (min(item["value"], 1.0 - item["value"]), item["value"]), reverse=True)
+    return vertices[:max_vertices]
+
+
+def build_interval_conflict_adjacency(vertices):
+    adjacency = [set() for _ in vertices]
+    for left in range(len(vertices)):
+        for right in range(left + 1, len(vertices)):
+            if intervals_overlap(
+                vertices[left]["start"],
+                vertices[left]["end"],
+                vertices[right]["start"],
+                vertices[right]["end"],
+            ):
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+    return adjacency
+
+
+def find_odd_cycles(adjacency, *, max_cycle_len: int):
+    seen = set()
+    cycles = []
+    for start in range(len(adjacency)):
+        stack = [(start, [start], {start})]
+        while stack:
+            current, path, used = stack.pop()
+            if len(path) > max_cycle_len:
+                continue
+            for nxt in adjacency[current]:
+                if nxt == start and len(path) >= 5 and len(path) % 2 == 1:
+                    cycle_key = canonical_cycle_key(path)
+                    if cycle_key not in seen:
+                        seen.add(cycle_key)
+                        cycles.append(tuple(path))
+                    continue
+                if nxt <= start or nxt in used or len(path) == max_cycle_len:
+                    continue
+                stack.append((nxt, [*path, nxt], used | {nxt}))
+    return cycles
+
+
+def canonical_cycle_key(cycle):
+    forward = list(cycle)
+    reverse = [cycle[0], *reversed(cycle[1:])]
+    rotations = []
+    for values in (forward, reverse):
+        for idx in range(len(values)):
+            rotations.append(tuple(values[idx:] + values[:idx]))
+    return min(rotations)
 
 
 def group_current_cost(lp, selected_words, f_values, g_values) -> float:
