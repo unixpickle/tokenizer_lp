@@ -1132,3 +1132,45 @@ multiprocessing overhead, not path enumeration. In serial, the same first pair
 test took about `154s`; with 8 workers it dropped to about `22.5s`. The main
 end-to-end bottleneck is still the large LP resolve after adding cuts: the
 iteration after pair rows took `235s` to resolve.
+
+### 10x Pair Candidate Sweep
+
+I reran the books experiment with the same full-hull settings but increased
+`--lp-short-word-pair-hull-max-pairs` from `800` to `8000`, and kept
+`--lp-cut-rounds 10`.
+
+Result:
+
+| Iteration | Active Cuts | New Cuts | Family Effect | LP Bound | Rounded Tokens |
+|---:|---:|---:|---|---:|---:|
+| 0 | 0 | 38 | individual full hull | 258,417.000 | 268,378 |
+| 1 | 38 | 4 | individual full hull | 258,431.750 | 268,378 |
+| 2 | 42 | 75 | pair hull | 258,431.750 | 268,378 |
+| 3 | 117 | 4 | individual full hull | 258,620.646 | 264,819 |
+| 4 | 121 | 22 | pair hull | 258,620.895 | 264,663 |
+| 5 | 143 | 2 | pair hull | 258,633.333 | 264,270 |
+| 6 | 145 | 0 | done | 258,633.333 | 265,807 |
+
+This converged under the higher round cap. It materially improved both the
+relaxed bound and the rounded tokenizer:
+
+| Families / Setting | Final Bound | Gain vs Base | Rounded Tokens | Wall Time |
+|---|---:|---:|---:|---:|
+| `short_word_full_hull,short_word_pair_hull`, 800 pairs | 258,513.542 | +96.542 | 268,218 | 475.77s |
+| `short_word_full_hull,short_word_pair_hull`, 8000 pairs | 258,633.333 | +216.333 | 265,807 | 1959.67s |
+
+Pair-separation timing with 8 workers:
+
+| Pair Round | Candidates | Tested Tasks | Pair Cuts | Wall Time | Worker Build Time | Worker Solve Time |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 9,346 | 7,912 | 75 | 313.269s | 18.064s | 40.137s |
+| 4 | 9,810 | 7,858 | 22 | 349.903s | 6.335s | 14.232s |
+| 5 | 9,620 | 7,825 | 2 | 383.556s | 0.762s | 1.730s |
+| 6 | 9,565 | 7,834 | 0 | 375.194s | 0 | 0 |
+
+The 10x sweep shows there are substantially more useful pair cuts in the tail.
+It also shows the current candidate-testing loop is inefficient: later rounds
+spend hundreds of wall-clock seconds proving thousands of candidate pairs have
+no violated cut. Worker build and solve time are much smaller than wall time in
+the late rounds, so batching, reducing task/process overhead, and better
+candidate filtering are the next obvious engineering targets.
