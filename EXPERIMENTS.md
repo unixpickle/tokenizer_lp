@@ -1039,3 +1039,96 @@ The bottleneck remains the main LP resolve, not hull separation:
 The result looks plausible rather than too good to be true: the bound is still
 well below the rounded tokenizer count (`268,378`), leaving about `9,946` tokens
 of rounded gap after the best cut batch.
+
+## Experimental Short-Word Pair Hulls
+
+I added `short_word_pair_hull` after checking that pair hulls should only be
+separated after individual word hulls are already satisfied. The combined
+separator enforces this by skipping pair separation in any round where
+`short_word_full_hull` still finds cuts.
+
+The pair separator:
+
+- ranks short words by fractional colour/edge signal;
+- proposes pairs through shared fractional token colours;
+- enumerates both words' paths exactly;
+- separates the full upward hull of the path-pair product;
+- skips pairs whose path-product row count exceeds a cap;
+- tests pair separator LPs in parallel worker processes.
+
+Books run:
+
+```bash
+uv run tokenizer-lp-train \
+  --data-dir ~/Desktop/books \
+  --vocab-size 512 \
+  --kind lp \
+  --max-token-length 8 \
+  --min-token-count 5 \
+  --pretokenizer nanochat \
+  --lp-cut-rounds 5 \
+  --lp-cuts-per-round 1000 \
+  --lp-cut-families short_word_full_hull,short_word_pair_hull \
+  --lp-short-word-full-hull-max-words 12000 \
+  --lp-short-word-full-hull-max-length 12 \
+  --lp-short-word-full-hull-max-colors 96 \
+  --lp-short-word-pair-hull-max-words 500 \
+  --lp-short-word-pair-hull-max-length 12 \
+  --lp-short-word-pair-hull-max-colors 96 \
+  --lp-short-word-pair-hull-max-pair-rows 250000 \
+  --lp-short-word-pair-hull-max-pairs 800 \
+  --lp-short-word-pair-hull-top-words-per-color 36 \
+  --lp-short-word-pair-hull-workers 8 \
+  --lp-word-support-max-paths 100000 \
+  --lp-solver highspy \
+  --lp-solution-cache-dir /tmp/tokenizer_lp_solution_cache
+```
+
+Result:
+
+| Iteration | Active Cuts | New Cuts | Family Effect | LP Bound | Rounded Tokens |
+|---:|---:|---:|---|---:|---:|
+| 0 | 0 | 38 | individual full hull | 258,417.000 | 268,378 |
+| 1 | 38 | 4 | individual full hull | 258,431.750 | 268,378 |
+| 2 | 42 | 19 | pair hull | 258,431.750 | 268,378 |
+| 3 | 61 | 4 | individual full hull | 258,512.542 | 268,218 |
+| 4 | 65 | 1 | pair hull | 258,513.542 | 268,218 |
+| 5 | 66 | 0 | done | 258,513.542 | 268,218 |
+
+This needed five cut-separation rounds before convergence under the configured
+limits. The sixth LP solve found no remaining individual or pair hull cuts, with
+66 active cuts total.
+
+Best bound so far:
+
+| Families | Final Bound | Gain vs Base | Rounded Tokens |
+|---|---:|---:|---:|
+| Base LP | 258,417.000 | 0 | 268,378 |
+| `short_word_full_hull` | 258,431.750 | +14.750 | 268,378 |
+| `short_word_full_hull,short_word_pair_hull` | 258,513.542 | +96.542 | 268,218 |
+
+Pair examples found after individual word hulls were active:
+
+| Left Word | Right Word | Violation |
+|---|---|---:|
+| `Ġromance` | `Ġroom` | 0.0833 |
+| `Ġsense` | `Ġseen` | 0.0833 |
+| `Ġseen` | `Ġsensation` | 0.0833 |
+| `Ġroom` | `Ġromantic` | 0.0833 |
+| `Ġwater` | `Ġmatter` | 0.0769 |
+| `Ġlast` | `Ġleast` | 0.0714 |
+| `Ġwhere` | `Ġwere` | 0.0714 |
+| `Ġmake` | `Ġmistake` | 0.0625 |
+
+Multiprocessing timing:
+
+| Pair Round | Candidates | Tested Tasks | Pair Cuts | Workers | Wall Time | Worker Build Time | Worker Solve Time |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 9,346 | 792 | 19 | 8 | 22.490s | 4.763s | 10.544s |
+| 4 | 9,487 | 783 | 1 | 8 | 22.979s | 0.368s | 0.830s |
+
+The pair-testing bottleneck is mostly many independent small separator LPs plus
+multiprocessing overhead, not path enumeration. In serial, the same first pair
+test took about `154s`; with 8 workers it dropped to about `22.5s`. The main
+end-to-end bottleneck is still the large LP resolve after adding cuts: the
+iteration after pair rows took `235s` to resolve.

@@ -201,7 +201,8 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated LP cut families. Supported: "
             "boundary,word_packing,global_token_packing,global_pair_packing,global_triple_packing,"
             "global_rank_count,word_rank_count,word_rank_length,path_config,path_multicover,path_min_cover,group_value,"
-            "threshold_value,group_budget_value,word_hull,short_word_hull,short_word_full_hull,group_value_deep,"
+            "threshold_value,group_budget_value,word_hull,short_word_hull,short_word_full_hull,"
+            "short_word_pair_hull,group_value_deep,"
             "conflict_clique,conflict_odd_cycle,word_support,bad_vocab_escape,"
             "bad_vocab_improvement,window_overlap,window_overlap_deep,word_path_cover,window_pair."
         ),
@@ -271,6 +272,48 @@ def parse_args() -> argparse.Namespace:
         default=64,
         help="Maximum local token colours allowed for short_word_full_hull; larger words are skipped.",
     )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-max-words",
+        type=int,
+        default=500,
+        help="Maximum short word types used to propose short_word_pair_hull pairs.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-max-length",
+        type=int,
+        default=12,
+        help="Maximum pretokenized byte length used by the short_word_pair_hull separator.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-max-colors",
+        type=int,
+        default=96,
+        help="Maximum union of local token colours allowed for a short_word_pair_hull pair.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-max-pair-rows",
+        type=int,
+        default=250000,
+        help="Maximum path-pair constraints allowed for one short_word_pair_hull separator LP.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-max-pairs",
+        type=int,
+        default=800,
+        help="Maximum candidate word pairs tested by short_word_pair_hull per separation round.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-top-words-per-color",
+        type=int,
+        default=36,
+        help="Number of words per fractional colour used to propose short_word_pair_hull candidates.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-workers",
+        type=int,
+        default=0,
+        help="Worker processes for short_word_pair_hull separation. Use 0 for cpu_count-1.",
+    )
     return parser.parse_args()
 
 
@@ -304,6 +347,13 @@ def main() -> None:
         short_word_full_hull_max_words=args.lp_short_word_full_hull_max_words,
         short_word_full_hull_max_length=args.lp_short_word_full_hull_max_length,
         short_word_full_hull_max_colors=args.lp_short_word_full_hull_max_colors,
+        short_word_pair_hull_max_words=args.lp_short_word_pair_hull_max_words,
+        short_word_pair_hull_max_length=args.lp_short_word_pair_hull_max_length,
+        short_word_pair_hull_max_colors=args.lp_short_word_pair_hull_max_colors,
+        short_word_pair_hull_max_pair_rows=args.lp_short_word_pair_hull_max_pair_rows,
+        short_word_pair_hull_max_pairs=args.lp_short_word_pair_hull_max_pairs,
+        short_word_pair_hull_top_words_per_color=args.lp_short_word_pair_hull_top_words_per_color,
+        short_word_pair_hull_workers=args.lp_short_word_pair_hull_workers,
     )
 
     if args.kind in {"lp", "both"}:
