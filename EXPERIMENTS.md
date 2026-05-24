@@ -1174,3 +1174,113 @@ spend hundreds of wall-clock seconds proving thousands of candidate pairs have
 no violated cut. Worker build and solve time are much smaller than wall time in
 the late rounds, so batching, reducing task/process overhead, and better
 candidate filtering are the next obvious engineering targets.
+
+### General Subset Hull Diagnostics
+
+I added `tokenizer-lp-subset-hulls` as an experimental diagnostic for arbitrary
+small word-subset hull cuts. It builds a projected upward hull over:
+
+- all selected word-local edge variables,
+- the shared token color variables touched by those words,
+- every product of local word segmentations, capped by `--max-product-rows`.
+
+The separator is exact for that projected subset: it searches for a violated
+linear inequality that is valid for every selected path product and for every
+upward token-color selection. This makes the diagnostic useful for checking
+whether a proposed subset family is genuinely adding ILP information, rather
+than relying on an invalid bound.
+
+Candidate generators implemented:
+
+- `color`: choose fractional token colors, especially colors near 0.5, then
+  collect the highest-mass words whose fractional flow uses that color.
+- `cluster`: build per-word vectors
+  `v[word][tau] = total fractional edge mass in word using token color tau`,
+  then propose small clusters using a mix of cosine similarity and Jaccard
+  overlap over each word's top colors.
+
+The first cheap scan ran after individual full word hulls, but before pair hulls:
+
+```bash
+uv run tokenizer-lp-subset-hulls \
+  --data-dir ~/Desktop/books \
+  --vocab-size 512 \
+  --mode both \
+  --apply-individual-hulls \
+  --individual-rounds 3 \
+  --individual-max-words 12000 \
+  --individual-max-length 12 \
+  --individual-max-colors 96 \
+  --candidate-words 400 \
+  --subset-size 3 \
+  --max-subsets 250 \
+  --max-product-rows 200000 \
+  --max-colors 128 \
+  --top-colors 40 \
+  --top-words-per-color 6 \
+  --cluster-neighbors 6 \
+  --print-cuts 20 \
+  --lp-solution-cache-dir /tmp/tokenizer_lp_solution_cache
+```
+
+Result:
+
+| Mode | Proposed Unique Subsets | Tested | Cuts | Time | Skips |
+|---|---:|---:|---:|---:|---|
+| color + cluster, triples | 5,049 | 250 | 8 | 131.889s | `no_cut=236`, `too_many_rows=6` |
+
+Top triple cuts all had violation `0.0714286`, including:
+
+| Words |
+|---|
+| `Ġwho` / `Ġwhere` / `Ġwere` |
+| `Ġwould` / `Ġwhere` / `Ġwere` |
+| `Ġwill` / `Ġwhere` / `Ġwere` |
+| `Ġhead` / `Ġhow` / `Ġhad` |
+| `Ġhas` / `Ġhead` / `Ġhad` |
+| `Ġhome` / `Ġhead` / `Ġhad` |
+
+These looked suspiciously pair-explained, so I reran with
+`--skip-subsets-with-pair-cuts`, which first tests every contained pair and only
+tests the larger subset if no pair already has a violated hull cut:
+
+| Mode | Proposed Unique Subsets | Tested | Cuts | Time | Skips |
+|---|---:|---:|---:|---:|---|
+| color + cluster, pair-clean triples | 5,049 | 250 | 0 | 133.254s | `no_cut=236`, `pair_cut=8`, `too_many_rows=6` |
+
+I also ran a pair-clean size-4 color-centered scan:
+
+```bash
+uv run tokenizer-lp-subset-hulls \
+  --data-dir ~/Desktop/books \
+  --vocab-size 512 \
+  --mode color \
+  --apply-individual-hulls \
+  --individual-rounds 3 \
+  --individual-max-words 12000 \
+  --individual-max-length 12 \
+  --individual-max-colors 96 \
+  --candidate-words 300 \
+  --subset-size 4 \
+  --max-subsets 100 \
+  --max-product-rows 200000 \
+  --max-colors 128 \
+  --top-colors 25 \
+  --top-words-per-color 6 \
+  --skip-subsets-with-pair-cuts \
+  --print-cuts 10 \
+  --lp-solution-cache-dir /tmp/tokenizer_lp_solution_cache
+```
+
+Result:
+
+| Mode | Proposed Unique Subsets | Tested | Cuts | Time | Skips |
+|---|---:|---:|---:|---:|---|
+| color, pair-clean quadruples | 365 | 100 | 0 | 122.555s | `pair_cut=12`, `no_cut=56`, `too_many_rows=32` |
+
+Conclusion so far: the general subset framework works and can find violated
+larger subset hulls, but the first cheap scans suggest the obvious triple and
+quadruple violations are mostly explained by already-useful pair hull cuts. The
+larger subset search is still valuable as a validation tool for new subset
+families, but pair hulls remain the best tightening-per-compute family found so
+far.
