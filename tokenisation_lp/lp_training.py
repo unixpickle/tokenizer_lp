@@ -50,6 +50,8 @@ class CutSeparationConfig:
     short_word_pair_hull_max_pairs: int = 800
     short_word_pair_hull_top_words_per_color: int = 36
     short_word_pair_hull_workers: int = 0
+    short_word_pair_hull_batch_size: int = 32
+    short_word_pair_hull_min_fractional_shared_colors: int = 1
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class LpSolveIteration:
     total_cuts: int
     added_cuts: int
     max_violation: float
+    fractional_colors: int
     candidates: list[possibleToken]
 
 
@@ -269,6 +272,10 @@ def solve_lp_vocabulary(
             raise RuntimeError(f"LP solve failed with {lp_solver}: {solution.message}")
 
         candidates = candidates_from_solution(tokens, lp, solution.x)
+        num_f = lp["num_nonfree_edges"]
+        num_g = lp["num_free_edges"]
+        t_values = solution.x[num_f + num_g :]
+        fractional_colors = int(np.count_nonzero((t_values > cut_tolerance) & (t_values < 1.0 - cut_tolerance)))
         candidates.objective_value = float(solution.fun)
         candidates.token_count_lower_bound = float(solution.fun)
         candidates.solve_seconds = solve_seconds
@@ -299,16 +306,18 @@ def solve_lp_vocabulary(
             total_cuts=len(existing_cut_keys),
             added_cuts=added_cuts,
             max_violation=max_violation,
+            fractional_colors=fractional_colors,
             candidates=list(candidates),
         )
         iterations.append(iteration_result)
         LOGGER.info(
             "LP iteration %d solved in %.3fs: objective=%.3f nonzero_tokens=%d "
-            "active_cuts=%d next_cuts=%d max_cut_violation=%.6g",
+            "fractional_colors=%d active_cuts=%d next_cuts=%d max_cut_violation=%.6g",
             iteration,
             solve_seconds,
             solution.fun,
             len(candidates),
+            fractional_colors,
             len(existing_cut_keys),
             added_cuts,
             max_violation,
@@ -409,6 +418,8 @@ class HighsWarmLpSolver:
         lb,
         ub,
         cache_dir=None,
+        highs_threads: int = 0,
+        highs_parallel: str = "on",
     ):
         import highspy
 
@@ -427,6 +438,12 @@ class HighsWarmLpSolver:
         self.highs.setOptionValue("output_flag", False)
         self.highs.setOptionValue("solver", "simplex")
         self.highs.setOptionValue("simplex_strategy", 1)
+        try:
+            self.highs.resetGlobalScheduler(True)
+        except RuntimeError:
+            self.highs.resetGlobalScheduler(False)
+        self.highs.setOptionValue("threads", int(highs_threads))
+        self.highs.setOptionValue("parallel", highs_parallel)
         self.highs.setOptionValue("presolve", "on")
         self.highs.passModel(self._build_model())
         self.has_basis = False
@@ -456,9 +473,9 @@ class HighsWarmLpSolver:
         self._save_cache(result)
         return result
 
-    def add_ub_rows(self, A_rows, b_rows) -> None:
+    def add_ub_rows(self, A_rows, b_rows) -> int | None:
         if A_rows is None:
-            return
+            return None
         A_rows = A_rows.tocsr()
         b_rows = np.asarray(b_rows, dtype=float)
         if A_rows.shape[1] != self.c.shape[0]:
@@ -468,10 +485,11 @@ class HighsWarmLpSolver:
         if A_rows.shape[0] != b_rows.shape[0]:
             raise ValueError("Cut matrix row count must match cut RHS length.")
         if A_rows.shape[0] == 0:
-            return
+            return None
 
         if self.has_basis:
             self.highs.setOptionValue("presolve", "off")
+        start_row = self.A_ub.shape[0]
         row_lower = np.full(A_rows.shape[0], -self.highspy.kHighsInf, dtype=float)
         row_upper = b_rows.astype(float, copy=False)
         self.highs.addRows(
@@ -485,6 +503,14 @@ class HighsWarmLpSolver:
         )
         self.A_ub = sp.vstack([self.A_ub, A_rows], format="csr")
         self.b_ub = np.concatenate([self.b_ub, b_rows])
+        return start_row
+
+    def change_ub_row_bounds(self, row_idx: int, lower: float, upper: float) -> None:
+        if self.has_basis:
+            self.highs.setOptionValue("presolve", "off")
+        highs_row_idx = self.A_eq.shape[0] + int(row_idx)
+        self.highs.changeRowBounds(highs_row_idx, float(lower), float(upper))
+        self.b_ub[row_idx] = float(upper)
 
     def change_col_bounds(self, col_idx: int, lower: float, upper: float) -> None:
         if self.has_basis:
@@ -831,6 +857,8 @@ def separate_cuts(
                 top_words_per_color=config.short_word_pair_hull_top_words_per_color,
                 max_paths=config.word_support_max_paths,
                 workers=config.short_word_pair_hull_workers,
+                batch_size=config.short_word_pair_hull_batch_size,
+                min_fractional_shared_colors=config.short_word_pair_hull_min_fractional_shared_colors,
             )
         )
     if "group_value_deep" in family_set:
@@ -1735,6 +1763,16 @@ def pair_hull_worker(task):
         "build_seconds": build_seconds,
         "solve_seconds": solve_seconds,
     }
+
+
+def pair_hull_batch_worker(tasks):
+    return [pair_hull_worker(task) for task in tasks]
+
+
+def chunked(items, chunk_size: int):
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, len(items), chunk_size):
+        yield items[start : start + chunk_size]
 
 
 def edge_capacity_weight(info, edge_weight: str) -> float:
@@ -2849,6 +2887,8 @@ def separate_short_word_pair_hull_cut_specs(
     top_words_per_color: int = 36,
     max_paths: int = 100000,
     workers: int = 0,
+    batch_size: int = 32,
+    min_fractional_shared_colors: int = 1,
 ):
     """Separate full upward local-hull cuts for pairs of short words."""
 
@@ -2872,6 +2912,7 @@ def separate_short_word_pair_hull_cut_specs(
     skipped_colors = 0
     skipped_paths = 0
     skipped_rows = 0
+    skipped_shared = 0
 
     for _, left_word, right_word in pair_rows[:max_pairs]:
         full_key_prefix = ("short_word_pair_hull", left_word, right_word)
@@ -2879,6 +2920,14 @@ def separate_short_word_pair_hull_cut_specs(
             continue
         left_colors = colors_by_word.setdefault(left_word, all_word_token_colors(lp, left_word))
         right_colors = colors_by_word.setdefault(right_word, all_word_token_colors(lp, right_word))
+        shared_fractional_colors = [
+            token_idx
+            for token_idx in set(left_colors) & set(right_colors)
+            if tolerance < float(t_values[token_idx]) < 1.0 - tolerance
+        ]
+        if len(shared_fractional_colors) < min_fractional_shared_colors:
+            skipped_shared += 1
+            continue
         selected_tokens = tuple(sorted(set(left_colors) | set(right_colors)))
         if len(selected_tokens) < 2 or len(selected_tokens) > max_colors:
             skipped_colors += 1
@@ -2911,9 +2960,10 @@ def separate_short_word_pair_hull_cut_specs(
     if not tasks:
         LOGGER.info(
             "short_word_pair_hull: no tasks after filtering candidates=%d skipped_colors=%d "
-            "skipped_paths=%d skipped_rows=%d",
+            "skipped_shared=%d skipped_paths=%d skipped_rows=%d",
             len(pair_rows),
             skipped_colors,
+            skipped_shared,
             skipped_paths,
             skipped_rows,
         )
@@ -2947,38 +2997,42 @@ def separate_short_word_pair_hull_cut_specs(
                 violations.append(cut)
     else:
         context = mp.get_context("fork") if hasattr(os, "fork") else None
+        task_batches = list(chunked(tasks, batch_size))
         with ProcessPoolExecutor(
             max_workers=worker_count,
             mp_context=context,
             initializer=init_pair_hull_worker,
             initargs=(worker_state,),
         ) as executor:
-            futures = [executor.submit(pair_hull_worker, task) for task in tasks]
+            futures = [executor.submit(pair_hull_batch_worker, batch) for batch in task_batches]
             for future in as_completed(futures):
-                result = future.result()
-                if result is None:
-                    continue
-                checked += 1
-                build_seconds += result["build_seconds"]
-                solve_seconds += result["solve_seconds"]
-                cut = result["cut"]
-                if cut is not None:
-                    violations.append(cut)
+                for result in future.result():
+                    if result is None:
+                        continue
+                    checked += 1
+                    build_seconds += result["build_seconds"]
+                    solve_seconds += result["solve_seconds"]
+                    cut = result["cut"]
+                    if cut is not None:
+                        violations.append(cut)
 
     elapsed = time.monotonic() - start_time
     LOGGER.info(
         "short_word_pair_hull: candidates=%d tasks=%d checked=%d cuts=%d workers=%d "
-        "wall=%.3fs worker_build=%.3fs worker_solve=%.3fs skipped_colors=%d "
-        "skipped_paths=%d skipped_rows=%d patterns=%d",
+        "batches=%d batch_size=%d wall=%.3fs worker_build=%.3fs worker_solve=%.3fs skipped_colors=%d "
+        "skipped_shared=%d skipped_paths=%d skipped_rows=%d patterns=%d",
         len(pair_rows),
         len(tasks),
         checked,
         len(violations),
         worker_count,
+        len(list(chunked(tasks, batch_size))) if worker_count > 1 else len(tasks),
+        max(1, int(batch_size)),
         elapsed,
         build_seconds,
         solve_seconds,
         skipped_colors,
+        skipped_shared,
         skipped_paths,
         skipped_rows,
         len(path_pattern_cache),

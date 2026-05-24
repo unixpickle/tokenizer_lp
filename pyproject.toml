@@ -14,7 +14,12 @@ dependencies = [
 [project.scripts]
 tokenizer-lp-train = "tokenisation_lp.train_eval:main"
 tokenizer-lp-branch-split = "tokenisation_lp.branch_split_lp:main"
+tokenizer-lp-branch-cut-tokenizer = "tokenisation_lp.branch_cut_tokenizer:main"
 tokenizer-lp-subset-hulls = "tokenisation_lp.subset_hull_diagnostics:main"
+tokenizer-lp-pair-hull-diagnostics = "tokenisation_lp.pair_hull_diagnostics:main"
+tokenizer-lp-alternative-pairs = "tokenisation_lp.alternative_pair_diagnostics:main"
+tokenizer-lp-pair-cut-impact = "tokenisation_lp.pair_cut_impact:main"
+tokenizer-lp-triplet-hulls = "tokenisation_lp.triplet_hull_diagnostics:main"
 
 [build-system]
 requires = ["hatchling"]

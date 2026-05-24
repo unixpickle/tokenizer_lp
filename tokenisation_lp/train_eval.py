@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 
@@ -33,9 +34,13 @@ def train_and_eval_lp(
     lp_solver: str,
 ):
     saw_iteration = False
+    best_tokens = None
+    best_iteration = None
+    lp_output_dir = output_dir / "lp"
+    iteration_dir = lp_output_dir / "iterations"
 
     def on_iteration(iteration, tokenizer):
-        nonlocal saw_iteration
+        nonlocal saw_iteration, best_tokens, best_iteration
         saw_iteration = True
         log_lp_relaxation_bound_value(
             f"LP iteration {iteration.iteration} relaxation bound",
@@ -60,6 +65,42 @@ def train_and_eval_lp(
             iteration.token_count_lower_bound,
             100.0 * gap_fraction,
         )
+        iteration_dir.mkdir(parents=True, exist_ok=True)
+        iteration_path = iteration_dir / f"lp_iteration_{iteration.iteration:03d}.json"
+        tokenizer.save(iteration_path)
+        LOGGER.info("Saved LP iteration %d rounded tokenizer to %s", iteration.iteration, iteration_path)
+        is_best = best_tokens is None or stats.tokens < best_tokens
+        if is_best:
+            best_tokens = stats.tokens
+            best_iteration = iteration.iteration
+            best_path = lp_output_dir / "best_so_far_tokenizer.json"
+            tokenizer.save(best_path)
+            LOGGER.info(
+                "Saved new best LP rounded tokenizer: iteration=%d tokens=%d path=%s",
+                iteration.iteration,
+                stats.tokens,
+                best_path,
+            )
+        metadata = {
+            "iteration": iteration.iteration,
+            "actual_tokens": stats.tokens,
+            "lower_bound": iteration.token_count_lower_bound,
+            "gap_fraction": gap_fraction,
+            "fractional_colors": iteration.fractional_colors,
+            "active_cuts": iteration.total_cuts,
+            "next_cuts": iteration.added_cuts,
+            "max_cut_violation": iteration.max_violation,
+            "best_iteration": best_iteration,
+            "best_tokens": best_tokens,
+        }
+        (iteration_dir / f"lp_iteration_{iteration.iteration:03d}_metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (lp_output_dir / "best_so_far_metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     result = train_lp_tokenizer(
         train_texts,
@@ -69,7 +110,7 @@ def train_and_eval_lp(
         unk_token=DEFAULT_UNK_TOKEN,
         min_token_count=min_token_count,
         max_token_length=max_token_length,
-        output_dir=output_dir / "lp",
+        output_dir=lp_output_dir,
         cut_rounds=cut_rounds,
         cuts_per_round=cuts_per_round,
         cut_tolerance=cut_tolerance,
@@ -314,6 +355,21 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Worker processes for short_word_pair_hull separation. Use 0 for cpu_count-1.",
     )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-batch-size",
+        type=int,
+        default=32,
+        help="Candidate pairs submitted per worker task for short_word_pair_hull multiprocessing.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-min-fractional-shared-colors",
+        type=int,
+        default=1,
+        help=(
+            "Minimum number of shared fractional token colors required before testing a "
+            "short_word_pair_hull candidate."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -354,6 +410,8 @@ def main() -> None:
         short_word_pair_hull_max_pairs=args.lp_short_word_pair_hull_max_pairs,
         short_word_pair_hull_top_words_per_color=args.lp_short_word_pair_hull_top_words_per_color,
         short_word_pair_hull_workers=args.lp_short_word_pair_hull_workers,
+        short_word_pair_hull_batch_size=args.lp_short_word_pair_hull_batch_size,
+        short_word_pair_hull_min_fractional_shared_colors=args.lp_short_word_pair_hull_min_fractional_shared_colors,
     )
 
     if args.kind in {"lp", "both"}:
