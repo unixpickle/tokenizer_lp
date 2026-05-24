@@ -7,7 +7,7 @@ from pathlib import Path
 from tokenisation_lp.bpe_training import train_bpe_tokenizer
 from tokenisation_lp.corpus import load_texts
 from tokenisation_lp.evaluation import evaluate_texts
-from tokenisation_lp.lp_training import train_lp_tokenizer
+from tokenisation_lp.lp_training import CutSeparationConfig, train_lp_tokenizer
 from tokenisation_lp.pretokenization import DEFAULT_SPECIAL_TOKENS, DEFAULT_UNK_TOKEN
 
 
@@ -28,6 +28,7 @@ def train_and_eval_lp(
     cuts_per_round: int,
     cut_tolerance: float,
     cut_families: tuple[str, ...],
+    cut_config: CutSeparationConfig,
     lp_solution_cache_dir: str | None,
     lp_solver: str,
 ):
@@ -73,6 +74,7 @@ def train_and_eval_lp(
         cuts_per_round=cuts_per_round,
         cut_tolerance=cut_tolerance,
         cut_families=cut_families,
+        cut_config=cut_config,
         lp_solution_cache_dir=lp_solution_cache_dir,
         lp_solver=lp_solver,
         iteration_callback=on_iteration,
@@ -199,7 +201,9 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated LP cut families. Supported: "
             "boundary,word_packing,global_token_packing,global_pair_packing,global_triple_packing,"
             "global_rank_count,word_rank_count,word_rank_length,path_config,path_multicover,path_min_cover,group_value,"
-            "conflict_clique,conflict_odd_cycle,word_support,window_overlap,window_overlap_deep,word_path_cover,window_pair."
+            "threshold_value,group_budget_value,word_hull,short_word_hull,short_word_full_hull,group_value_deep,"
+            "conflict_clique,conflict_odd_cycle,word_support,bad_vocab_escape,"
+            "bad_vocab_improvement,window_overlap,window_overlap_deep,word_path_cover,window_pair."
         ),
     )
     parser.add_argument(
@@ -212,6 +216,60 @@ def parse_args() -> argparse.Namespace:
         choices=("highspy", "scipy"),
         default="highspy",
         help="LP solver backend. highspy keeps a simplex model alive for iterative cut warm starts.",
+    )
+    parser.add_argument(
+        "--lp-word-support-max-words",
+        type=int,
+        default=2000,
+        help="Maximum suspicious word types scanned by the word_support separator.",
+    )
+    parser.add_argument(
+        "--lp-word-support-max-rank",
+        type=int,
+        default=20,
+        help="Maximum fractional token colours selected per word_support cut.",
+    )
+    parser.add_argument(
+        "--lp-word-support-max-paths",
+        type=int,
+        default=100000,
+        help="Maximum exact segmentation paths enumerated per word_support candidate.",
+    )
+    parser.add_argument(
+        "--lp-short-word-hull-max-words",
+        type=int,
+        default=2000,
+        help="Maximum short word types scanned by the short_word_hull separator.",
+    )
+    parser.add_argument(
+        "--lp-short-word-hull-max-length",
+        type=int,
+        default=10,
+        help="Maximum pretokenized byte length scanned by the short_word_hull separator.",
+    )
+    parser.add_argument(
+        "--lp-short-word-hull-max-rank",
+        type=int,
+        default=16,
+        help="Maximum fractional token colours selected per short_word_hull cut.",
+    )
+    parser.add_argument(
+        "--lp-short-word-full-hull-max-words",
+        type=int,
+        default=250,
+        help="Maximum frequent short word types scanned by the short_word_full_hull separator.",
+    )
+    parser.add_argument(
+        "--lp-short-word-full-hull-max-length",
+        type=int,
+        default=8,
+        help="Maximum pretokenized byte length scanned by the short_word_full_hull separator.",
+    )
+    parser.add_argument(
+        "--lp-short-word-full-hull-max-colors",
+        type=int,
+        default=64,
+        help="Maximum local token colours allowed for short_word_full_hull; larger words are skipped.",
     )
     return parser.parse_args()
 
@@ -236,6 +294,17 @@ def main() -> None:
         for family in args.lp_cut_families.split(",")
         if family.strip()
     )
+    cut_config = CutSeparationConfig(
+        word_support_max_words=args.lp_word_support_max_words,
+        word_support_max_rank=args.lp_word_support_max_rank,
+        word_support_max_paths=args.lp_word_support_max_paths,
+        short_word_hull_max_words=args.lp_short_word_hull_max_words,
+        short_word_hull_max_length=args.lp_short_word_hull_max_length,
+        short_word_hull_max_rank=args.lp_short_word_hull_max_rank,
+        short_word_full_hull_max_words=args.lp_short_word_full_hull_max_words,
+        short_word_full_hull_max_length=args.lp_short_word_full_hull_max_length,
+        short_word_full_hull_max_colors=args.lp_short_word_full_hull_max_colors,
+    )
 
     if args.kind in {"lp", "both"}:
         train_and_eval_lp(
@@ -251,6 +320,7 @@ def main() -> None:
             cuts_per_round=args.lp_cuts_per_round,
             cut_tolerance=args.lp_cut_tolerance,
             cut_families=cut_families,
+            cut_config=cut_config,
             lp_solution_cache_dir=args.lp_solution_cache_dir,
             lp_solver=args.lp_solver,
         )

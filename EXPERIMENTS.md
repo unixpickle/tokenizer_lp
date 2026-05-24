@@ -727,3 +727,315 @@ Separated support cuts:
 | After boundary + word-packing cleanup | 2 | 0.5 | `Ġoptimistic`, `Ġfurniture` |
 
 This family is valid and matches the intended “average segmentation mixture needs enough colour support” idea. On this corpus it is real but weak: it adds another `+0.750` tokens to the relaxed bound after cleanup. The useful cuts came from relatively low-frequency repeated words, so the objective movement is small.
+
+## Bad-Vocabulary Escape Cuts
+
+I also tried the more literal Benders-like version based on a nearby integral vocabulary. The separator rounds the current fractional colour vector to the top `sum(t)` token colours, computes each word's rounded-vocabulary cost `K`, and enumerates every path with `< K` tokens.
+
+Two variants were tested:
+
+- `bad_vocab_escape`: find a hitting set `H` of all paths better than the rounded vocabulary and add:
+
+  ```text
+  word_cost >= K * (1 - sum_{tau in H} t_tau)
+  ```
+
+- `bad_vocab_improvement`: for the off-vocabulary escape tokens, compute the set function `cap(U)` = best token-count improvement achievable by a better path whose off-vocab tokens are contained in `U`; add a modular upper bound:
+
+  ```text
+  K - word_cost <= alpha + sum beta_tau t_tau
+  ```
+
+The second form is stronger because it bounds the amount of improvement, not just whether any better path is possible.
+
+Diagnostics at the base LP showed many words where the rounded vocab is much worse than the fractional LP:
+
+```text
+bad rounded words: 5,851
+total weighted rounded-vs-LP gap: 33,976.25 token occurrences
+```
+
+Examples:
+
+| Word | Freq | Rounded Cost K | LP Word Cost | Gap |
+|---|---:|---:|---:|---:|
+| `Ġwhen` | 231 | 4 | 1.5 | 2.5 |
+| `âĢĻd` | 224 | 4 | 1.5 | 2.5 |
+| `Ġmore` | 169 | 4 | 1.5 | 2.5 |
+| `Ġalways` | 107 | 5 | 2.0 | 3.0 |
+
+However, the simple hitting-set cut was too weak: for these high-weight words, the current fractional `t` vector already has enough total escape-token support, so the cut is satisfied.
+
+Book results:
+
+| Cut Families | Final Bound | Gain vs Base | Gain vs Boundary Cleanup | Rounded Tokens |
+|---|---:|---:|---:|---:|
+| `bad_vocab_escape` | 258,417.000 | 0 | n/a | 268,378 |
+| `bad_vocab_improvement` | 258,417.750 | +0.750 | n/a | 268,378 |
+| `boundary,word_packing,bad_vocab_improvement` | 258,420.750 | +3.750 | 0 | 268,378 |
+
+So the bad-vocabulary Benders idea is valid in this escape-set form, and the improvement-capacity version does cut the base LP. But after the boundary/word-packing cleanup, it does not add anything on this corpus. The stronger `word_support` dual cut remains slightly better because it is derived from the current fractional word-flow mixture rather than from one rounded vocabulary.
+
+## Word-Support Effort Sweep
+
+I added three CLI knobs for the exact `word_support` separator:
+
+- `--lp-word-support-max-words`: number of suspicious word types scanned.
+- `--lp-word-support-max-rank`: number of fractional token colours selected for one support cut.
+- `--lp-word-support-max-paths`: exact segmentation path enumeration cap per word.
+
+The goal was to check whether cranking CPU finds materially stronger support cuts. All runs below used the books corpus, `vocab_size=512`, nanochat pretokenization, `max_token_length=8`, `min_token_count=5`, HiGHS, and the LP solution cache in `/tmp/tokenizer_lp_solution_cache`.
+
+Full train-loop results with `word_support` alone:
+
+| Setting | Limits `(words, rank, paths)` | Final Bound | Gain vs Base | Cuts by Round | Wall Time |
+|---|---:|---:|---:|---|---:|
+| small | `(500, 10, 20k)` | 258,417.750 | +0.750 | `5, 1, 0` | 14.73s |
+| default | `(2000, 20, 100k)` | 258,417.750 | +0.750 | `5, 1, 0` | 14.70s |
+| deep | `(5000, 30, 300k)` | 258,417.750 | +0.750 | `5, 1, 0` | 14.82s |
+
+Full train-loop results with cleanup plus `word_support`:
+
+| Setting | Limits `(words, rank, paths)` | Final Bound | Gain vs Base | Cuts by Round | Wall Time |
+|---|---:|---:|---:|---|---:|
+| small | `(500, 10, 20k)` | 258,421.500 | +4.500 | `31, 2, 0` | 16.51s |
+| default | `(2000, 20, 100k)` | 258,421.500 | +4.500 | `31, 2, 0` | 16.58s |
+| deep | `(5000, 30, 300k)` | 258,421.500 | +4.500 | `31, 2, 0` | 16.69s |
+| xdeep | `(12000, 50, 1000k)` | 258,421.500 | +4.500 | `31, 2, 0` | 16.64s |
+
+Direct separation timing on cached LP points shows where the CPU goes:
+
+| LP Point | Setting | Limits `(words, rank, paths)` | Cuts | Max Violation | Separator Time |
+|---|---|---:|---:|---:|---:|
+| Base | tiny | `(100, 8, 5k)` | 0 | 0 | 0.115s |
+| Base | small | `(500, 10, 20k)` | 0 | 0 | 0.393s |
+| Base | default | `(2000, 20, 100k)` | 5 | 0.5 | 3.723s |
+| Base | deep | `(5000, 30, 300k)` | 8 | 1.0 | 7.639s |
+| Base | xdeep | `(12000, 50, 1000k)` | 8 | 1.0 | 8.069s |
+| Cleanup | tiny | `(100, 8, 5k)` | 0 | 0 | 0.087s |
+| Cleanup | small | `(500, 10, 20k)` | 0 | 0 | 0.391s |
+| Cleanup | default | `(2000, 20, 100k)` | 2 | 0.5 | 3.722s |
+| Cleanup | deep | `(5000, 30, 300k)` | 4 | 1.0 | 7.277s |
+| Cleanup | xdeep | `(12000, 50, 1000k)` | 4 | 1.0 | 8.056s |
+
+The direct separator can find a few additional candidate inequalities at deeper settings, but those candidates did not improve the final LP bound on this corpus. The useful bound movement saturates at `+0.750` from `word_support`, and the combined cleanup result saturates at `+4.500`. Past the default setting, extra CPU mostly finds redundant or non-binding cuts.
+
+## Ordered Cut-Family Followup
+
+I tried the remaining proposed cut directions in order on the books corpus with
+`vocab_size=512`, nanochat pretokenization, `max_token_length=8`,
+`min_token_count=5`, HiGHS, and cached LP solves in
+`/tmp/tokenizer_lp_solution_cache`.
+
+### 1. Threshold / Value-Function Cuts
+
+Implemented as `threshold_value`. For one word and selected fractional token
+colours `S`, compute the exact value function:
+
+```text
+F(U) = shortest segmentation cost when U subset S is active
+```
+
+All token colours outside `S` are left unrestricted, so `F` is a valid lower
+bound for the full ILP. The separator adds the best affine lower bound on `F`
+at the current fractional `t[S]`.
+
+Result: no violated cuts.
+
+| Families | Final Bound | Added vs Base | Wall Time |
+|---|---:|---:|---:|
+| `threshold_value` | 258,417.000 | 0 | 3.52s |
+| `boundary,word_packing,threshold_value` | 258,420.750 | +3.750 | 5.86s |
+
+This suggests the current remaining fractional examples are not explained by a
+single-word shortest-cost lower envelope over only the selected colours. The
+path-mixture support constraints are the stronger per-word view here.
+
+### 2. Exact Per-Word Path-Hull Support Cuts
+
+Implemented as `word_hull`. For a word and selected colours `S`, enumerate all
+segmentation paths and optimize a nonnegative token-support dual:
+
+```text
+y · incidence(path) + gamma <= sum_{tau in R(path) cap S} b_tau
+b_tau >= 0
+sum_tau b_tau <= 1
+```
+
+This gives the valid cut:
+
+```text
+y · flow + gamma <= b · t
+```
+
+The `sum b <= 1` constraint only normalizes the separator; any nonnegative
+`b` satisfying the path inequalities gives a valid support cut. The separator
+only emits cuts when every path for the word was enumerated.
+
+Result: this is the best new family so far.
+
+| Families | Final Bound | Gain vs Base | Gain vs Boundary Cleanup | Cuts by Round | Wall Time |
+|---|---:|---:|---:|---|---:|
+| `word_hull` | 258,418.750 | +1.750 | n/a | `5, 1, 0` | 207.28s |
+| `boundary,word_packing,word_hull` | 258,422.500 | +5.500 | +1.750 | `31, 1, 0` | 218.05s |
+| `boundary,word_packing,word_hull,word_support` | 258,422.500 | +5.500 | +1.750 | `36, 0` | 235.54s |
+
+The first-round `word_hull` cuts target the same five words as
+`word_support`, but the optimized coefficients move the LP more:
+
+| Word | Frequency | Violation | Selected Colours |
+|---|---:|---:|---:|
+| `Ġsentence` | 10 | 0.5 | 6 |
+| `Ġsentences` | 5 | 0.5 | 5 |
+| `Ġfurniture` | 4 | 0.5 | 6 |
+| `Ġoptimistic` | 3 | 0.5 | 8 |
+| `Ġindependent` | 2 | 0.5 | 8 |
+
+`word_support` adds no extra bound once `word_hull` is present, so this looks
+like the cleaner replacement for that branch.
+
+### 3. Multi-Word Value Cuts
+
+Retested existing `group_value` and added a deeper alias `group_value_deep`
+that scans more seed words, more candidate words, larger groups, and rank-10
+token sets. These are valid multi-word lower-envelope cuts over a shared token
+set, again leaving all outside tokens unrestricted.
+
+Result: no violated cuts.
+
+| Families | Final Bound | Added vs Base | Wall Time |
+|---|---:|---:|---:|
+| `group_value` | 258,417.000 | 0 | 4.44s |
+| `group_value_deep` | 258,417.000 | 0 | 15.03s |
+| `boundary,word_packing,group_value_deep` | 258,420.750 | +3.750 | 31.36s |
+
+The candidate shared-token groups I tried do not expose a multi-word
+incompatibility beyond what the per-word and cleanup cuts already see.
+
+### 4. Ranked Local-Vocabulary Budget Cuts
+
+Implemented as `group_budget_value`. For a group of words `G` and selected
+token set `S`, compute:
+
+```text
+B(k) = best weighted segmentation cost using at most k active colours from S
+```
+
+Then add the best affine lower bound depending only on `sum_{tau in S} t_tau`.
+This is weaker than full `group_value` for the same `(G,S)`, but it tests the
+specific local-vocabulary-budget hypothesis.
+
+Result: no violated cuts.
+
+| Families | Final Bound | Added vs Base | Wall Time |
+|---|---:|---:|---:|
+| `group_budget_value` | 258,417.000 | 0 | 4.91s |
+| `boundary,word_packing,group_budget_value` | 258,420.750 | +3.750 | 8.82s |
+
+This does not seem like the remaining weakness on the books corpus.
+
+### 5. Lifted Window / Boundary Cuts
+
+Retested the existing lifted local window families together:
+`window_pair,window_overlap_deep`. These compute compatible local interval
+packing capacities over suspicious byte windows and selected token colours.
+
+Result: many cuts separate, but they barely move the bound, and after standard
+cleanup they do not move it at all.
+
+| Families | Final Bound | Gain vs Base | Gain vs Boundary Cleanup | Cuts by Round | Wall Time |
+|---|---:|---:|---:|---|---:|
+| `window_pair,window_overlap_deep` | 258,417.167 | +0.167 | n/a | `54, 0` | 238.96s |
+| `boundary,word_packing,window_pair,window_overlap_deep` | 258,420.750 | +3.750 | 0 | `80, 11, 0` | 253.90s |
+
+The local window cuts are valid and visibly violated, but they are mostly
+redundant with the standard cleanup rows for objective purposes.
+
+Current best relaxation from these tests:
+
+| Families | Final Bound | Gain vs Base | Rounded Tokens |
+|---|---:|---:|---:|
+| Base LP | 258,417.000 | 0 | 268,378 |
+| `boundary,word_packing` | 258,420.750 | +3.750 | 268,378 |
+| `boundary,word_packing,word_support` | 258,421.500 | +4.500 | 268,378 |
+| `boundary,word_packing,word_hull` | 258,422.500 | +5.500 | 268,378 |
+
+The useful next direction is therefore not broader single-word value functions
+or local window packing. The clearest remaining signal is exact path-support
+hull separation; improving its CPU cost or batching many word-hull cuts is the
+most promising path from this set.
+
+## Experimental Full Short-Word Hulls
+
+I implemented `short_word_full_hull` to test how much the restricted
+`word_hull` separator leaves on the table.
+
+This separator is broader than `word_hull`. For a short word, it uses all local
+token colours when the count is below a cap, enumerates every segmentation path,
+and separates over the upward local hull:
+
+```text
+choose one path p
+t_S may be any binary superset of colours used by p
+```
+
+Equivalently, it searches arbitrary signed inequalities over word edge-flow and
+`t[S]`, with an L1 coefficient normalization, and enforces validity for the
+whole upward closure of every path. This is still a projection onto selected
+local colours; it does not add auxiliary path variables to the main LP.
+
+The upward closure is important. A token can be globally selected but unused by
+this word, so a local colour-support variable must not be equated with global
+`t`. The valid local integer vertices are path plus any selected-token superset.
+
+On the base books LP, raw-frequency short words did not produce cuts:
+
+| Scan | Candidates | Scanned | Cuts | Separator Time |
+|---|---:|---:|---:|---:|
+| `len<=8`, top 250 frequent/fractional | 7,420 | 250 | 0 | 0.225s |
+| `len<=8`, top 1000 frequent/fractional | 7,420 | 1000 | 0 | 0.942s |
+| `len<=10`, top 1000 frequent/fractional | 9,689 | 1000 | 0 | 1.243s |
+| `len<=12`, top 1000 frequent/fractional | 10,592 | 1000 | 0 | 1.389s |
+
+Ranking by fractional signal instead finds cuts, mostly on low-frequency short
+words:
+
+| Scan | Checked | Cuts | Max Normalized Violation | Separator Time |
+|---|---:|---:|---:|---:|
+| `len<=10`, top 2000 signal | 1,999 | 3 | 0.125 | 4.049s |
+| `len<=12`, top 2000 signal | 1,999 | 5 | 0.125 | 7.316s |
+| `len<=12`, all signal | 10,262 | 31 | 0.1667 | 37.676s |
+| `len<=16`, all signal | 10,592 | 32 | 0.1667 | 86.237s |
+
+Example full-hull cuts from the all-signal scan:
+
+| Word | Length | Frequency | Local Colours | Paths | Violation |
+|---|---:|---:|---:|---:|---:|
+| `Ġheeeere` | 8 | 1 | 10 | 72 | 0.1667 |
+| `âĢľWooow` | 8 | 1 | 13 | 72 | 0.1667 |
+| `âĢľWooooow` | 10 | 1 | 13 | 248 | 0.1667 |
+| `âĢľNoooo` | 8 | 2 | 12 | 88 | 0.1667 |
+| `Ġsentences` | 10 | 5 | 41 | 509 | 0.125 |
+| `Ġsentence` | 9 | 10 | 34 | 255 | 0.125 |
+
+Book training results with `len<=12`, up to 12k signal-ranked words, and up to
+96 local colours:
+
+| Families | Active Cuts | Final Bound | Gain vs Base | Rounded Tokens | Wall Time |
+|---|---:|---:|---:|---:|---:|
+| `short_word_full_hull` | 42 | 258,431.750 | +14.750 | 268,378 | 330.43s |
+| `boundary,word_packing,short_word_full_hull` | 67 | 258,432.000 | +15.000 | 268,378 | 342.12s |
+
+This is the largest tightening so far. The standard cleanup rows add only
+`+0.250` once these full local hull cuts are present, so this family is
+capturing most of the previous cleanup signal and more.
+
+The bottleneck remains the main LP resolve, not hull separation:
+
+- Full-hull separation for `len<=12`, all signal-ranked words: `37.676s`.
+- First LP resolve after 38 full-hull cuts: `210.718s`.
+- First LP resolve after 64 cleanup+full-hull cuts: `219.543s`.
+
+The result looks plausible rather than too good to be true: the bound is still
+well below the rounded tokenizer count (`268,378`), leaving about `9,946` tokens
+of rounded gap after the best cut batch.

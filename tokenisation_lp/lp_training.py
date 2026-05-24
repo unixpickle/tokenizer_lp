@@ -30,6 +30,19 @@ LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class CutSeparationConfig:
+    word_support_max_words: int = 2000
+    word_support_max_rank: int = 20
+    word_support_max_paths: int = 100000
+    short_word_hull_max_words: int = 2000
+    short_word_hull_max_length: int = 10
+    short_word_hull_max_rank: int = 16
+    short_word_full_hull_max_words: int = 250
+    short_word_full_hull_max_length: int = 8
+    short_word_full_hull_max_colors: int = 64
+
+
+@dataclass(frozen=True)
 class LpTrainingResult:
     tokenizer: LpDpTokenizer
     vocab: list[str]
@@ -69,6 +82,7 @@ def train_lp_tokenizer(
     cuts_per_round: int = 100,
     cut_tolerance: float = 1e-6,
     cut_families: tuple[str, ...] = ("boundary",),
+    cut_config: CutSeparationConfig | None = None,
     lp_solution_cache_dir: str | Path | None = None,
     lp_solver: str = "highspy",
     iteration_callback: Callable[[LpSolveIteration, LpDpTokenizer], None] | None = None,
@@ -112,6 +126,7 @@ def train_lp_tokenizer(
         cuts_per_round=cuts_per_round,
         cut_tolerance=cut_tolerance,
         cut_families=cut_families,
+        cut_config=cut_config,
         lp_solution_cache_dir=lp_solution_cache_dir,
         lp_solver=lp_solver,
         iteration_callback=handle_iteration,
@@ -165,6 +180,7 @@ def solve_lp_vocabulary(
     cuts_per_round: int = 100,
     cut_tolerance: float = 1e-6,
     cut_families: tuple[str, ...] = ("boundary",),
+    cut_config: CutSeparationConfig | None = None,
     lp_solution_cache_dir: str | Path | None = None,
     lp_solver: str = "highspy",
     iteration_callback: Callable[[LpSolveIteration], None] | None = None,
@@ -177,6 +193,7 @@ def solve_lp_vocabulary(
         result.status = "empty-budget"
         result.iterations = []
         return result
+    cut_config = cut_config or CutSeparationConfig()
 
     words = list(word_counts)
     freqs = [word_counts[word] for word in words]
@@ -259,6 +276,7 @@ def solve_lp_vocabulary(
                 max_cuts=cuts_per_round,
                 tolerance=cut_tolerance,
                 families=cut_families,
+                config=cut_config,
             )
             added_cuts = len(cut_keys)
 
@@ -575,9 +593,11 @@ def separate_cuts(
     max_cuts: int,
     tolerance: float,
     families: tuple[str, ...],
+    config: CutSeparationConfig | None = None,
 ):
     if max_cuts <= 0:
         return None, np.array([], dtype=float), [], 0.0
+    config = config or CutSeparationConfig()
 
     num_f = lp["num_nonfree_edges"]
     num_g = lp["num_free_edges"]
@@ -718,6 +738,87 @@ def separate_cuts(
                 tolerance=tolerance,
             )
         )
+    if "threshold_value" in family_set:
+        violations.extend(
+            separate_threshold_value_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
+    if "group_budget_value" in family_set:
+        violations.extend(
+            separate_group_budget_value_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
+    if "word_hull" in family_set:
+        violations.extend(
+            separate_word_hull_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                max_words=config.word_support_max_words,
+                max_rank=min(config.word_support_max_rank, 16),
+                max_paths=config.word_support_max_paths,
+            )
+        )
+    if "short_word_hull" in family_set:
+        violations.extend(
+            separate_short_word_hull_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                max_words=config.short_word_hull_max_words,
+                max_word_length=config.short_word_hull_max_length,
+                max_rank=config.short_word_hull_max_rank,
+                max_paths=config.word_support_max_paths,
+            )
+        )
+    if "short_word_full_hull" in family_set:
+        violations.extend(
+            separate_short_word_full_hull_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                max_words=config.short_word_full_hull_max_words,
+                max_word_length=config.short_word_full_hull_max_length,
+                max_colors=config.short_word_full_hull_max_colors,
+                max_paths=config.word_support_max_paths,
+            )
+        )
+    if "group_value_deep" in family_set:
+        violations.extend(
+            separate_group_value_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                seed_words=250,
+                candidate_words=3000,
+                group_words=500,
+                max_rank=10,
+            )
+        )
     if "conflict_clique" in family_set:
         violations.extend(
             separate_conflict_clique_cut_specs(
@@ -741,6 +842,31 @@ def separate_cuts(
     if "word_support" in family_set:
         violations.extend(
             separate_word_support_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                max_words=config.word_support_max_words,
+                max_rank=config.word_support_max_rank,
+                max_paths=config.word_support_max_paths,
+            )
+        )
+    if "bad_vocab_escape" in family_set:
+        violations.extend(
+            separate_bad_vocab_escape_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+            )
+        )
+    if "bad_vocab_improvement" in family_set:
+        violations.extend(
+            separate_bad_vocab_improvement_cut_specs(
                 lp,
                 f_values,
                 x_values[num_f : num_f + num_g],
@@ -1388,6 +1514,85 @@ def rank_suspicious_words(lp, f_values, *, max_words: int):
     return [word_idx for _, word_idx in scores[:max_words]]
 
 
+def rank_short_fractional_words(
+    lp,
+    f_values,
+    t_values,
+    *,
+    max_words: int,
+    max_word_length: int,
+    tolerance: float,
+):
+    rows = []
+    for word_idx, edge_indices in lp["word_nonfree_edges"].items():
+        word_len = lp["word_lengths"][word_idx]
+        if word_len > max_word_length:
+            continue
+        score = 0.0
+        for edge_idx in edge_indices:
+            edge_value = float(f_values[edge_idx])
+            if not (tolerance < edge_value < 1.0 - tolerance):
+                continue
+            info = lp["nonfree_edge_info"][edge_idx]
+            token_value = float(t_values[info["token_index"]])
+            if not (tolerance < token_value < 1.0 - tolerance):
+                continue
+            score += (
+                min(edge_value, 1.0 - edge_value)
+                * min(token_value, 1.0 - token_value)
+                * max(1, info["end"] - info["start"])
+            )
+        if score <= 0.0:
+            continue
+        weight = float(lp["word_weights"][word_idx])
+        rows.append((-weight * score, word_len, -weight, word_idx))
+    rows.sort()
+    return [word_idx for _, _, _, word_idx in rows[:max_words]]
+
+
+def rank_frequent_short_fractional_words(
+    lp,
+    f_values,
+    t_values,
+    *,
+    max_words: int,
+    max_word_length: int,
+    tolerance: float,
+):
+    rows = []
+    for word_idx, edge_indices in lp["word_nonfree_edges"].items():
+        word_len = lp["word_lengths"][word_idx]
+        if word_len > max_word_length:
+            continue
+        fractional_signal = 0.0
+        for edge_idx in edge_indices:
+            edge_value = float(f_values[edge_idx])
+            info = lp["nonfree_edge_info"][edge_idx]
+            token_value = float(t_values[info["token_index"]])
+            if tolerance < edge_value < 1.0 - tolerance or tolerance < token_value < 1.0 - tolerance:
+                fractional_signal += (
+                    min(max(edge_value, token_value), 1.0 - min(edge_value, token_value))
+                    * max(1, info["end"] - info["start"])
+                )
+        if fractional_signal <= 0.0:
+            continue
+        weight = float(lp["word_weights"][word_idx])
+        rows.append((-weight, word_len, -weight * fractional_signal, word_idx))
+    rows.sort()
+    return [word_idx for _, _, _, word_idx in rows[:max_words]]
+
+
+def all_word_token_colors(lp, word_idx: int):
+    return tuple(
+        sorted(
+            {
+                lp["nonfree_edge_info"][edge_idx]["token_index"]
+                for edge_idx in lp["word_nonfree_edges"].get(word_idx, [])
+            }
+        )
+    )
+
+
 def edge_capacity_weight(info, edge_weight: str) -> float:
     if edge_weight == "count":
         return 1.0
@@ -1881,6 +2086,197 @@ def separate_group_value_cut_specs(
     return violations
 
 
+def separate_threshold_value_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 1000,
+    max_rank: int = 12,
+):
+    """Separate per-word value-function cuts over selected token colours.
+
+    For a word w and selected colours S, define F(U) as the shortest
+    segmentation cost when U subset S is active and every colour outside S is
+    left unrestricted. Any affine lower bound on F(U) is valid for the full
+    ILP, because omitted colours can only make F smaller.
+    """
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        selected_tokens = word_support_selected_tokens(
+            lp,
+            f_values,
+            t_values,
+            word_idx,
+            max_rank=max_rank,
+            tolerance=tolerance,
+        )
+        if len(selected_tokens) < 2:
+            continue
+        full_key_prefix = ("threshold_value", word_idx, selected_tokens)
+        if any(key[:3] == full_key_prefix for key in existing_cut_keys):
+            continue
+
+        word_weight = float(lp["word_weights"][word_idx])
+        current_cost = word_weight * float(
+            f_values[lp["word_nonfree_edges"].get(word_idx, [])].sum()
+            + g_values[lp["word_free_edges"].get(word_idx, [])].sum()
+        )
+        value_by_mask = group_value_function(lp, (word_idx,), selected_tokens)
+        bound = affine_lower_bound_for_values(value_by_mask, t_values, selected_tokens)
+        if bound is None:
+            continue
+        alpha, beta_values, rhs_at_current = bound
+        violation = rhs_at_current - current_cost
+        if violation <= tolerance:
+            continue
+
+        beta_key = tuple(round(float(beta), 8) for beta in beta_values)
+        full_key = (*full_key_prefix, beta_key)
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        entries.extend((edge_idx, -word_weight) for edge_idx in lp["word_nonfree_edges"].get(word_idx, []))
+        entries.extend((num_f + edge_idx, -word_weight) for edge_idx in lp["word_free_edges"].get(word_idx, []))
+        entries.extend(
+            (t_offset + token_idx, float(beta))
+            for token_idx, beta in zip(selected_tokens, beta_values)
+            if abs(beta) > 1e-12
+        )
+        violations.append((violation, full_key, entries, -float(alpha)))
+
+    return violations
+
+
+def separate_group_budget_value_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    seed_words: int = 120,
+    candidate_words: int = 1500,
+    group_words: int = 300,
+    max_rank: int = 10,
+):
+    """Separate group cuts depending only on local selected-vocab size.
+
+    For a word group G and token set S, B(k) is the best weighted segmentation
+    cost obtainable with at most k active colours from S, with all colours
+    outside S unrestricted. A lower affine support of B(sum_S t) is ILP-valid.
+    """
+
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+    suspicious = rank_suspicious_words(lp, f_values, max_words=candidate_words)
+    suspicious_set = set(suspicious)
+    token_word_scores = defaultdict(list)
+    word_fractional_scores = {}
+
+    for word_idx in suspicious:
+        score = 0.0
+        by_token_score = defaultdict(float)
+        word_weight = float(lp["word_weights"][word_idx])
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            value = float(f_values[edge_idx])
+            if value <= tolerance:
+                continue
+            info = lp["nonfree_edge_info"][edge_idx]
+            token_idx = info["token_index"]
+            edge_score = value * max(1, info["end"] - info["start"])
+            by_token_score[token_idx] += edge_score
+            if tolerance < float(t_values[token_idx]) < 1.0 - tolerance:
+                score += min(value, 1.0 - value) * max(1, info["end"] - info["start"])
+        if score <= 0:
+            continue
+        word_fractional_scores[word_idx] = word_weight * score
+        for token_idx, token_score in by_token_score.items():
+            token_word_scores[token_idx].append((word_weight * token_score, word_idx))
+
+    for rows in token_word_scores.values():
+        rows.sort(reverse=True)
+
+    candidate_sets = []
+    for word_idx in suspicious[:seed_words]:
+        selected = word_support_selected_tokens(
+            lp,
+            f_values,
+            t_values,
+            word_idx,
+            max_rank=max_rank,
+            tolerance=tolerance,
+        )
+        if len(selected) >= 2:
+            candidate_sets.append(selected)
+
+    seen_sets = set()
+    violations = []
+    for selected_tokens in candidate_sets:
+        selected_tokens = tuple(sorted(selected_tokens))
+        if selected_tokens in seen_sets:
+            continue
+        seen_sets.add(selected_tokens)
+        full_key_prefix = ("group_budget_value", selected_tokens)
+        if any(key[:2] == full_key_prefix for key in existing_cut_keys):
+            continue
+
+        group_score = defaultdict(float)
+        for token_idx in selected_tokens:
+            for score, word_idx in token_word_scores.get(token_idx, [])[:group_words]:
+                if word_idx in suspicious_set:
+                    group_score[word_idx] += score
+        selected_words = tuple(
+            word_idx
+            for word_idx, _ in sorted(
+                group_score.items(),
+                key=lambda item: (item[1], word_fractional_scores.get(item[0], 0.0)),
+                reverse=True,
+            )[:group_words]
+        )
+        if not selected_words:
+            continue
+
+        current_cost = group_current_cost(lp, selected_words, f_values, g_values)
+        values_by_budget = group_budget_value_function(lp, selected_words, selected_tokens)
+        bound = affine_lower_bound_for_budget_values(values_by_budget, t_values, selected_tokens)
+        if bound is None:
+            continue
+        alpha, beta, rhs_at_current = bound
+        violation = rhs_at_current - current_cost
+        if violation <= tolerance:
+            continue
+
+        full_key = (*full_key_prefix, selected_words, round(float(alpha), 8), round(float(beta), 8))
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        for word_idx in selected_words:
+            word_weight = float(lp["word_weights"][word_idx])
+            entries.extend((edge_idx, -word_weight) for edge_idx in lp["word_nonfree_edges"].get(word_idx, []))
+            entries.extend((num_f + edge_idx, -word_weight) for edge_idx in lp["word_free_edges"].get(word_idx, []))
+        entries.extend(
+            (t_offset + token_idx, float(beta))
+            for token_idx in selected_tokens
+            if abs(beta) > 1e-12
+        )
+        violations.append((violation, full_key, entries, -float(alpha)))
+
+    return violations
+
+
 def separate_conflict_clique_cut_specs(
     lp,
     f_values,
@@ -2058,6 +2454,241 @@ def separate_word_support_cut_specs(
     return violations
 
 
+def separate_word_hull_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 1000,
+    max_rank: int = 16,
+    max_paths: int = 100000,
+):
+    """Separate weighted exact path-hull support cuts for one word.
+
+    For selected colours S, enumerate all paths p through a word. The separator
+    searches for nonnegative token coefficients b, sum(b)<=1, and edge
+    potentials y,gamma such that:
+
+        y·incidence(p) + gamma <= sum_{tau in R(p) cap S} b_tau
+
+    This implies y·flow + gamma <= b·t for every integral tokenizer. Optimizing
+    b at the current fractional solution gives a small exact support-hull cut.
+    """
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        if lp["word_weights"][word_idx] <= 1:
+            continue
+        selected_tokens = word_support_selected_tokens(
+            lp,
+            f_values,
+            t_values,
+            word_idx,
+            max_rank=max_rank,
+            tolerance=tolerance,
+        )
+        if len(selected_tokens) < 2:
+            continue
+        full_key_prefix = ("word_hull", word_idx, selected_tokens)
+        if any(key[:3] == full_key_prefix for key in existing_cut_keys):
+            continue
+
+        paths = enumerate_word_edge_paths(lp, word_idx, max_paths=max_paths)
+        if paths is None or len(paths) < 2:
+            continue
+        cut = word_hull_cut_from_paths(
+            lp,
+            f_values,
+            g_values,
+            t_values,
+            word_idx,
+            selected_tokens,
+            paths,
+            tolerance=tolerance,
+        )
+        if cut is None:
+            continue
+        violation, edge_coefficients, token_coefficients, rhs, coefficient_key = cut
+        full_key = (*full_key_prefix, coefficient_key)
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        entries.extend((col_idx, coefficient) for col_idx, coefficient in edge_coefficients.items())
+        entries.extend(
+            (t_offset + token_idx, coefficient)
+            for token_idx, coefficient in token_coefficients.items()
+        )
+        violations.append((violation, full_key, entries, rhs))
+
+    return violations
+
+
+def separate_short_word_hull_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 2000,
+    max_word_length: int = 10,
+    max_rank: int = 16,
+    max_paths: int = 100000,
+):
+    """Separate exact projected hull cuts on short words with fractional colours."""
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+    path_pattern_cache = {}
+
+    for word_idx in rank_short_fractional_words(
+        lp,
+        f_values,
+        t_values,
+        max_words=max_words,
+        max_word_length=max_word_length,
+        tolerance=tolerance,
+    ):
+        selected_tokens = word_support_selected_tokens(
+            lp,
+            f_values,
+            t_values,
+            word_idx,
+            max_rank=max_rank,
+            tolerance=tolerance,
+        )
+        if len(selected_tokens) < 2:
+            continue
+        full_key_prefix = ("short_word_hull", word_idx, selected_tokens)
+        if any(key[:3] == full_key_prefix for key in existing_cut_keys):
+            continue
+
+        paths = enumerate_word_edge_paths_by_pattern(
+            lp,
+            word_idx,
+            max_paths=max_paths,
+            cache=path_pattern_cache,
+        )
+        if paths is None or len(paths) < 2:
+            continue
+        cut = word_hull_cut_from_paths(
+            lp,
+            f_values,
+            g_values,
+            t_values,
+            word_idx,
+            selected_tokens,
+            paths,
+            tolerance=tolerance,
+        )
+        if cut is None:
+            continue
+        violation, edge_coefficients, token_coefficients, rhs, coefficient_key = cut
+        full_key = (*full_key_prefix, coefficient_key)
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        entries.extend((col_idx, coefficient) for col_idx, coefficient in edge_coefficients.items())
+        entries.extend(
+            (t_offset + token_idx, coefficient)
+            for token_idx, coefficient in token_coefficients.items()
+        )
+        violations.append((violation, full_key, entries, rhs))
+
+    return violations
+
+
+def separate_short_word_full_hull_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 250,
+    max_word_length: int = 8,
+    max_colors: int = 64,
+    max_paths: int = 100000,
+):
+    """Separate full upward local-hull cuts for frequent short words.
+
+    For selected local colours S, the integral local set contains one
+    segmentation path plus any global token-activation superset of the colours
+    used by that path. This separator searches arbitrary signed inequalities
+    over edge-flow and t[S], with L1 coefficient normalization, that are valid
+    for the whole upward local hull.
+    """
+
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+    path_pattern_cache = {}
+
+    for word_idx in rank_short_fractional_words(
+        lp,
+        f_values,
+        t_values,
+        max_words=max_words,
+        max_word_length=max_word_length,
+        tolerance=tolerance,
+    ):
+        selected_tokens = all_word_token_colors(lp, word_idx)
+        if len(selected_tokens) < 2 or len(selected_tokens) > max_colors:
+            continue
+        full_key_prefix = ("short_word_full_hull", word_idx, selected_tokens)
+        if any(key[:3] == full_key_prefix for key in existing_cut_keys):
+            continue
+
+        paths = enumerate_word_edge_paths_by_pattern(
+            lp,
+            word_idx,
+            max_paths=max_paths,
+            cache=path_pattern_cache,
+        )
+        if paths is None or len(paths) < 2:
+            continue
+        cut = full_upward_hull_cut_from_paths(
+            lp,
+            f_values,
+            g_values,
+            t_values,
+            word_idx,
+            selected_tokens,
+            paths,
+            tolerance=tolerance,
+        )
+        if cut is None:
+            continue
+        violation, edge_coefficients, token_coefficients, rhs, coefficient_key = cut
+        full_key = (*full_key_prefix, coefficient_key)
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        entries.extend((col_idx, coefficient) for col_idx, coefficient in edge_coefficients.items())
+        entries.extend(
+            (t_offset + token_idx, coefficient)
+            for token_idx, coefficient in token_coefficients.items()
+        )
+        violations.append((violation, full_key, entries, rhs))
+
+    return violations
+
+
 def word_support_selected_tokens(lp, f_values, t_values, word_idx: int, *, max_rank: int, tolerance: float):
     scores = defaultdict(float)
     for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
@@ -2098,6 +2729,109 @@ def enumerate_word_edge_paths(lp, word_idx: int, *, max_paths: int):
         for end, col_idx, token_idx in by_start.get(position, []):
             next_set = token_set if token_idx is None else token_set | frozenset((token_idx,))
             visit(end, (*columns, col_idx), next_set)
+
+    visit(0, tuple(), frozenset())
+    if len(paths) > max_paths:
+        return None
+    return paths
+
+
+def enumerate_word_edge_paths_by_pattern(lp, word_idx: int, *, max_paths: int, cache: dict):
+    local_edges, pattern_key, token_class_to_index = word_edge_pattern(lp, word_idx)
+    cached_paths = cache.get(pattern_key)
+    if cached_paths is None and pattern_key not in cache:
+        cached_paths = enumerate_local_pattern_paths(
+            local_edges,
+            lp["word_lengths"][word_idx],
+            max_paths=max_paths,
+        )
+        cache[pattern_key] = cached_paths
+    if cached_paths is None:
+        return None
+
+    paths = []
+    for local_indices, token_classes in cached_paths:
+        columns = tuple(local_edges[local_idx]["col"] for local_idx in local_indices)
+        token_set = frozenset(token_class_to_index[token_class] for token_class in token_classes)
+        paths.append((columns, token_set))
+    return paths
+
+
+def word_edge_pattern(lp, word_idx: int):
+    num_f = lp["num_nonfree_edges"]
+    token_class_by_string = {}
+    local_edges = []
+
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        info = lp["nonfree_edge_info"][edge_idx]
+        token = info["token"]
+        token_class = token_class_by_string.setdefault(token, len(token_class_by_string))
+        local_edges.append(
+            {
+                "start": info["start"],
+                "end": info["end"],
+                "token_class": token_class,
+                "token_index": info["token_index"],
+                "col": edge_idx,
+                "is_free": False,
+            }
+        )
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        info = lp["free_edge_info"][edge_idx]
+        local_edges.append(
+            {
+                "start": info["start"],
+                "end": info["end"],
+                "token_class": None,
+                "token_index": None,
+                "col": num_f + edge_idx,
+                "is_free": True,
+            }
+        )
+
+    local_edges.sort(
+        key=lambda edge: (
+            edge["start"],
+            edge["end"],
+            edge["is_free"],
+            -1 if edge["token_class"] is None else edge["token_class"],
+        )
+    )
+    pattern_key = (
+        lp["word_lengths"][word_idx],
+        tuple(
+            (
+                edge["start"],
+                edge["end"],
+                -1 if edge["token_class"] is None else edge["token_class"],
+                1 if edge["is_free"] else 0,
+            )
+            for edge in local_edges
+        ),
+    )
+    token_class_to_index = {}
+    for edge in local_edges:
+        if edge["token_class"] is not None:
+            token_class_to_index[edge["token_class"]] = edge["token_index"]
+    return local_edges, pattern_key, token_class_to_index
+
+
+def enumerate_local_pattern_paths(local_edges, target: int, *, max_paths: int):
+    by_start = defaultdict(list)
+    for local_idx, edge in enumerate(local_edges):
+        by_start[edge["start"]].append((edge["end"], local_idx, edge["token_class"]))
+
+    paths = []
+
+    def visit(position: int, local_indices: tuple[int, ...], token_classes: frozenset[int]):
+        if len(paths) > max_paths:
+            return
+        if position == target:
+            paths.append((local_indices, token_classes))
+            return
+        for end, local_idx, token_class in by_start.get(position, []):
+            next_classes = token_classes if token_class is None else token_classes | frozenset((token_class,))
+            visit(end, (*local_indices, local_idx), next_classes)
 
     visit(0, tuple(), frozenset())
     if len(paths) > max_paths:
@@ -2174,6 +2908,542 @@ def word_support_cut_from_paths(
     gamma = float(result.x[-1])
     rhs_value = -gamma
     return violation, edge_coefficients, token_coefficients, rhs_value, gamma
+
+
+def word_hull_cut_from_paths(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    word_idx: int,
+    selected_tokens: tuple[int, ...],
+    paths,
+    *,
+    tolerance: float,
+):
+    num_f = lp["num_nonfree_edges"]
+    selected_position = {token_idx: idx for idx, token_idx in enumerate(selected_tokens)}
+    word_columns = []
+    current_values = []
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        word_columns.append(edge_idx)
+        current_values.append(float(f_values[edge_idx]))
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        word_columns.append(num_f + edge_idx)
+        current_values.append(float(g_values[edge_idx]))
+    col_position = {col_idx: idx for idx, col_idx in enumerate(word_columns)}
+
+    num_edge_vars = len(word_columns)
+    gamma_col = num_edge_vars
+    token_offset = num_edge_vars + 1
+    num_vars = token_offset + len(selected_tokens)
+
+    rows = []
+    cols = []
+    data = []
+    rhs = []
+    for row_idx, (path_columns, path_tokens) in enumerate(paths):
+        for col_idx in path_columns:
+            rows.append(row_idx)
+            cols.append(col_position[col_idx])
+            data.append(1.0)
+        rows.append(row_idx)
+        cols.append(gamma_col)
+        data.append(1.0)
+        for token_idx in path_tokens:
+            pos = selected_position.get(token_idx)
+            if pos is None:
+                continue
+            rows.append(row_idx)
+            cols.append(token_offset + pos)
+            data.append(-1.0)
+        rhs.append(0.0)
+
+    sum_row = len(paths)
+    for pos in range(len(selected_tokens)):
+        rows.append(sum_row)
+        cols.append(token_offset + pos)
+        data.append(1.0)
+    rhs.append(1.0)
+
+    constraints = sp.coo_matrix(
+        (data, (rows, cols)),
+        shape=(len(paths) + 1, num_vars),
+        dtype=float,
+    ).tocsr()
+    objective = -np.array(
+        [
+            *current_values,
+            1.0,
+            *[-float(t_values[token_idx]) for token_idx in selected_tokens],
+        ],
+        dtype=float,
+    )
+    bounds = [(None, None)] * (num_edge_vars + 1) + [(0.0, None)] * len(selected_tokens)
+    result = linprog(
+        c=objective,
+        A_ub=constraints,
+        b_ub=np.array(rhs, dtype=float),
+        bounds=bounds,
+        method="highs",
+    )
+    if not result.success:
+        return None
+
+    violation = -float(result.fun)
+    if violation <= tolerance:
+        return None
+
+    edge_coefficients = {
+        col_idx: float(coefficient)
+        for col_idx, coefficient in zip(word_columns, result.x[:num_edge_vars])
+        if abs(coefficient) > 1e-10
+    }
+    token_coefficients = {
+        token_idx: -float(coefficient)
+        for token_idx, coefficient in zip(selected_tokens, result.x[token_offset:])
+        if abs(coefficient) > 1e-10
+    }
+    gamma = float(result.x[gamma_col])
+    rhs_value = -gamma
+    coefficient_key = (
+        round(gamma, 8),
+        tuple(round(float(value), 8) for value in result.x[token_offset:]),
+    )
+    return violation, edge_coefficients, token_coefficients, rhs_value, coefficient_key
+
+
+def full_upward_hull_cut_from_paths(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    word_idx: int,
+    selected_tokens: tuple[int, ...],
+    paths,
+    *,
+    tolerance: float,
+):
+    num_f = lp["num_nonfree_edges"]
+    selected_position = {token_idx: idx for idx, token_idx in enumerate(selected_tokens)}
+    word_columns = []
+    current_values = []
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        word_columns.append(edge_idx)
+        current_values.append(float(f_values[edge_idx]))
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        word_columns.append(num_f + edge_idx)
+        current_values.append(float(g_values[edge_idx]))
+
+    col_position = {col_idx: idx for idx, col_idx in enumerate(word_columns)}
+    num_edge_vars = len(word_columns)
+    num_token_vars = len(selected_tokens)
+    a_pos_offset = 0
+    a_neg_offset = num_edge_vars
+    b_pos_offset = 2 * num_edge_vars
+    b_neg_offset = b_pos_offset + num_token_vars
+    gamma_col = b_neg_offset + num_token_vars
+    num_vars = gamma_col + 1
+
+    rows = []
+    cols = []
+    data = []
+    rhs = []
+
+    for row_idx, (path_columns, path_tokens) in enumerate(paths):
+        for col_idx in path_columns:
+            pos = col_position[col_idx]
+            rows.extend((row_idx, row_idx))
+            cols.extend((a_pos_offset + pos, a_neg_offset + pos))
+            data.extend((1.0, -1.0))
+        for pos in range(num_token_vars):
+            rows.append(row_idx)
+            cols.append(b_pos_offset + pos)
+            data.append(1.0)
+        for token_idx in path_tokens:
+            pos = selected_position.get(token_idx)
+            if pos is None:
+                continue
+            rows.append(row_idx)
+            cols.append(b_neg_offset + pos)
+            data.append(-1.0)
+        rows.append(row_idx)
+        cols.append(gamma_col)
+        data.append(1.0)
+        rhs.append(0.0)
+
+    norm_row = len(paths)
+    for pos in range(num_edge_vars):
+        rows.extend((norm_row, norm_row))
+        cols.extend((a_pos_offset + pos, a_neg_offset + pos))
+        data.extend((1.0, 1.0))
+    for pos in range(num_token_vars):
+        rows.extend((norm_row, norm_row))
+        cols.extend((b_pos_offset + pos, b_neg_offset + pos))
+        data.extend((1.0, 1.0))
+    rhs.append(1.0)
+
+    constraints = sp.coo_matrix(
+        (data, (rows, cols)),
+        shape=(len(paths) + 1, num_vars),
+        dtype=float,
+    ).tocsr()
+    objective = np.zeros(num_vars, dtype=float)
+    for pos, value in enumerate(current_values):
+        objective[a_pos_offset + pos] = -value
+        objective[a_neg_offset + pos] = value
+    for pos, token_idx in enumerate(selected_tokens):
+        token_value = float(t_values[token_idx])
+        objective[b_pos_offset + pos] = -token_value
+        objective[b_neg_offset + pos] = token_value
+    objective[gamma_col] = -1.0
+
+    bounds = [(0.0, None)] * num_vars
+    bounds[gamma_col] = (None, None)
+    result = linprog(
+        c=objective,
+        A_ub=constraints,
+        b_ub=np.array(rhs, dtype=float),
+        bounds=bounds,
+        method="highs",
+    )
+    if not result.success:
+        return None
+
+    violation = -float(result.fun)
+    if violation <= tolerance:
+        return None
+
+    edge_coefficients = {}
+    for col_idx, pos in col_position.items():
+        coefficient = float(result.x[a_pos_offset + pos] - result.x[a_neg_offset + pos])
+        if abs(coefficient) > 1e-10:
+            edge_coefficients[col_idx] = coefficient
+    token_coefficients = {}
+    for token_idx, pos in selected_position.items():
+        coefficient = float(result.x[b_pos_offset + pos] - result.x[b_neg_offset + pos])
+        if abs(coefficient) > 1e-10:
+            token_coefficients[token_idx] = coefficient
+
+    gamma = float(result.x[gamma_col])
+    coefficient_key = (
+        round(gamma, 8),
+        tuple(round(float(token_coefficients.get(token_idx, 0.0)), 8) for token_idx in selected_tokens),
+    )
+    return violation, edge_coefficients, token_coefficients, -gamma, coefficient_key
+
+
+def separate_bad_vocab_escape_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 800,
+    max_paths: int = 50000,
+    max_exact_hitting_tokens: int = 80,
+):
+    """Separate cuts from a nearby rounded vocabulary's bad word costs.
+
+    Let V be the top-sum(t) rounded vocabulary. If V tokenizes word w in K
+    tokens, every path with <K tokens must use at least one token outside V.
+    For any hitting set H of those better paths:
+
+        word_cost >= K * (1 - sum_{tau in H} t_tau)
+
+    The better paths are enumerated exactly up to K-1 tokens; otherwise no cut
+    is emitted for that word.
+    """
+
+    budget = int(round(float(t_values.sum())))
+    if budget <= 0:
+        return []
+    active_tokens = rounded_active_token_set(t_values, budget)
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+
+    candidate_rows = []
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        if lp["word_weights"][word_idx] <= 1:
+            continue
+        current_cost = float(
+            f_values[lp["word_nonfree_edges"].get(word_idx, [])].sum()
+            + g_values[lp["word_free_edges"].get(word_idx, [])].sum()
+        )
+        rounded_cost = word_shortest_path_cost_active(lp, word_idx, active_tokens)
+        gap = rounded_cost - current_cost
+        if gap > tolerance and rounded_cost >= 2:
+            candidate_rows.append((gap * lp["word_weights"][word_idx], gap, word_idx, rounded_cost, current_cost))
+    candidate_rows.sort(reverse=True)
+
+    for _, gap, word_idx, rounded_cost, current_cost in candidate_rows:
+        full_key_prefix = ("bad_vocab_escape", word_idx, rounded_cost)
+        if any(key[:3] == full_key_prefix for key in existing_cut_keys):
+            continue
+        better_path_sets = enumerate_better_path_escape_sets(
+            lp,
+            word_idx,
+            active_tokens,
+            max_length=rounded_cost - 1,
+            max_paths=max_paths,
+        )
+        if better_path_sets is None or not better_path_sets:
+            continue
+        if any(len(token_set) == 0 for token_set in better_path_sets):
+            continue
+
+        token_universe = sorted(set().union(*better_path_sets))
+        if len(token_universe) <= max_exact_hitting_tokens:
+            hitting_set = exact_min_weight_hitting_set(better_path_sets, t_values, token_universe)
+        else:
+            hitting_set = greedy_weighted_hitting_set(better_path_sets, t_values)
+        if not hitting_set:
+            continue
+        if not all(hitting_set & set(token_set) for token_set in better_path_sets):
+            continue
+
+        hit_sum = float(t_values[list(hitting_set)].sum())
+        lhs_value = current_cost + rounded_cost * hit_sum
+        rhs_value = float(rounded_cost)
+        violation = rhs_value - lhs_value
+        if violation <= tolerance:
+            continue
+
+        full_key = (*full_key_prefix, tuple(sorted(hitting_set)))
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        entries.extend((edge_idx, -1.0) for edge_idx in lp["word_nonfree_edges"].get(word_idx, []))
+        entries.extend((num_f + edge_idx, -1.0) for edge_idx in lp["word_free_edges"].get(word_idx, []))
+        entries.extend((t_offset + token_idx, -float(rounded_cost)) for token_idx in hitting_set)
+        violations.append((violation, full_key, entries, -rhs_value))
+
+    return violations
+
+
+def separate_bad_vocab_improvement_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 800,
+    max_paths: int = 50000,
+    max_escape_tokens: int = 18,
+):
+    """Separate bad-vocabulary improvement-capacity cuts.
+
+    For rounded vocabulary V and word cost K under V, every shorter path has an
+    off-vocabulary escape-token set E and improvement K-|p|. For all active
+    escape sets U, cap(U) is the best improvement achievable by any enumerated
+    path with E subset U. A modular upper bound on cap gives:
+
+        K - word_cost <= alpha + sum beta_tau t_tau
+    """
+
+    budget = int(round(float(t_values.sum())))
+    if budget <= 0:
+        return []
+    active_tokens = rounded_active_token_set(t_values, budget)
+    violations = []
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+
+    candidate_rows = []
+    for word_idx in rank_suspicious_words(lp, f_values, max_words=max_words):
+        if lp["word_weights"][word_idx] <= 1:
+            continue
+        current_cost = float(
+            f_values[lp["word_nonfree_edges"].get(word_idx, [])].sum()
+            + g_values[lp["word_free_edges"].get(word_idx, [])].sum()
+        )
+        rounded_cost = word_shortest_path_cost_active(lp, word_idx, active_tokens)
+        improvement = rounded_cost - current_cost
+        if improvement > tolerance and rounded_cost >= 2:
+            candidate_rows.append(
+                (improvement * lp["word_weights"][word_idx], improvement, word_idx, rounded_cost, current_cost)
+            )
+    candidate_rows.sort(reverse=True)
+
+    for _, improvement, word_idx, rounded_cost, current_cost in candidate_rows:
+        full_key_prefix = ("bad_vocab_improvement", word_idx, rounded_cost)
+        if any(key[:3] == full_key_prefix for key in existing_cut_keys):
+            continue
+        better_paths = enumerate_better_path_escape_sets_with_lengths(
+            lp,
+            word_idx,
+            active_tokens,
+            max_length=rounded_cost - 1,
+            max_paths=max_paths,
+        )
+        if better_paths is None or not better_paths:
+            continue
+        if any(len(escape_set) == 0 for escape_set, _ in better_paths):
+            continue
+
+        token_universe = sorted(set().union(*(escape_set for escape_set, _ in better_paths)))
+        if len(token_universe) > max_escape_tokens:
+            continue
+        capacities = improvement_capacities(
+            better_paths,
+            token_universe,
+            rounded_cost=rounded_cost,
+        )
+        bound = modular_upper_bound_for_capacities(capacities, t_values, token_universe)
+        if bound is None:
+            continue
+        alpha, beta_values, rhs_at_current = bound
+        violation = improvement - rhs_at_current
+        if violation <= tolerance:
+            continue
+
+        beta_key = tuple(round(float(beta), 8) for beta in beta_values)
+        full_key = (*full_key_prefix, tuple(token_universe), beta_key)
+        if full_key in existing_cut_keys:
+            continue
+
+        entries = []
+        entries.extend((edge_idx, -1.0) for edge_idx in lp["word_nonfree_edges"].get(word_idx, []))
+        entries.extend((num_f + edge_idx, -1.0) for edge_idx in lp["word_free_edges"].get(word_idx, []))
+        entries.extend(
+            (t_offset + token_idx, -float(beta))
+            for token_idx, beta in zip(token_universe, beta_values)
+            if abs(beta) > 1e-12
+        )
+        violations.append((violation, full_key, entries, float(alpha - rounded_cost)))
+
+    return violations
+
+
+def rounded_active_token_set(t_values, budget: int) -> set[int]:
+    rows = [(float(value), token_idx) for token_idx, value in enumerate(t_values)]
+    rows.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    return {token_idx for _, token_idx in rows[:budget]}
+
+
+def word_shortest_path_cost_active(lp, word_idx: int, active_tokens: set[int]) -> int:
+    by_start = defaultdict(list)
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        info = lp["nonfree_edge_info"][edge_idx]
+        if info["token_index"] in active_tokens:
+            by_start[info["start"]].append(info["end"])
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        info = lp["free_edge_info"][edge_idx]
+        by_start[info["start"]].append(info["end"])
+
+    target = lp["word_lengths"][word_idx]
+    costs = [10**9] * (target + 1)
+    costs[0] = 0
+    for position in range(target):
+        if costs[position] >= 10**9:
+            continue
+        next_cost = costs[position] + 1
+        for end in by_start.get(position, []):
+            if next_cost < costs[end]:
+                costs[end] = next_cost
+    return int(costs[target])
+
+
+def enumerate_better_path_escape_sets(
+    lp,
+    word_idx: int,
+    active_tokens: set[int],
+    *,
+    max_length: int,
+    max_paths: int,
+):
+    by_start = defaultdict(list)
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        info = lp["nonfree_edge_info"][edge_idx]
+        token_idx = info["token_index"]
+        by_start[info["start"]].append((info["end"], None if token_idx in active_tokens else token_idx))
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        info = lp["free_edge_info"][edge_idx]
+        by_start[info["start"]].append((info["end"], None))
+
+    target = lp["word_lengths"][word_idx]
+    results = []
+
+    def visit(position: int, remaining: int, escape_set: frozenset[int]):
+        if len(results) > max_paths:
+            return
+        if position == target:
+            results.append(escape_set)
+            return
+        if remaining == 0:
+            return
+        for end, token_idx in by_start.get(position, []):
+            next_set = escape_set if token_idx is None else escape_set | frozenset((token_idx,))
+            visit(end, remaining - 1, next_set)
+
+    visit(0, max_length, frozenset())
+    if len(results) > max_paths:
+        return None
+    return results
+
+
+def enumerate_better_path_escape_sets_with_lengths(
+    lp,
+    word_idx: int,
+    active_tokens: set[int],
+    *,
+    max_length: int,
+    max_paths: int,
+):
+    by_start = defaultdict(list)
+    for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+        info = lp["nonfree_edge_info"][edge_idx]
+        token_idx = info["token_index"]
+        by_start[info["start"]].append((info["end"], None if token_idx in active_tokens else token_idx))
+    for edge_idx in lp["word_free_edges"].get(word_idx, []):
+        info = lp["free_edge_info"][edge_idx]
+        by_start[info["start"]].append((info["end"], None))
+
+    target = lp["word_lengths"][word_idx]
+    results = []
+
+    def visit(position: int, remaining: int, length: int, escape_set: frozenset[int]):
+        if len(results) > max_paths:
+            return
+        if position == target:
+            results.append((escape_set, length))
+            return
+        if remaining == 0:
+            return
+        for end, token_idx in by_start.get(position, []):
+            next_set = escape_set if token_idx is None else escape_set | frozenset((token_idx,))
+            visit(end, remaining - 1, length + 1, next_set)
+
+    visit(0, max_length, 0, frozenset())
+    if len(results) > max_paths:
+        return None
+    return results
+
+
+def improvement_capacities(better_paths, token_universe, *, rounded_cost: int):
+    token_position = {token_idx: bit for bit, token_idx in enumerate(token_universe)}
+    rank = len(token_universe)
+    capacities = {mask: 0.0 for mask in range(1 << rank)}
+    for escape_set, path_length in better_paths:
+        mask = 0
+        for token_idx in escape_set:
+            mask |= 1 << token_position[token_idx]
+        capacities[mask] = max(capacities[mask], float(rounded_cost - path_length))
+
+    for bit in range(rank):
+        bit_value = 1 << bit
+        for mask in range(1 << rank):
+            if mask & bit_value:
+                capacities[mask] = max(capacities[mask], capacities[mask ^ bit_value])
+    return capacities
 
 
 def conflict_vertices_for_word(lp, f_values, g_values, word_idx: int, *, max_vertices: int, tolerance: float):
@@ -2280,6 +3550,22 @@ def group_value_function(lp, selected_words, selected_tokens):
     return values
 
 
+def group_budget_value_function(lp, selected_words, selected_tokens):
+    value_by_mask = group_value_function(lp, selected_words, selected_tokens)
+    rank = len(selected_tokens)
+    values_by_budget = {budget: float("inf") for budget in range(rank + 1)}
+    for mask, value in value_by_mask.items():
+        active = int(mask.bit_count())
+        if value < values_by_budget[active]:
+            values_by_budget[active] = float(value)
+
+    best_so_far = float("inf")
+    for budget in range(rank + 1):
+        best_so_far = min(best_so_far, values_by_budget[budget])
+        values_by_budget[budget] = best_so_far
+    return values_by_budget
+
+
 def word_shortest_path_cost(lp, word_idx: int, token_position: dict[int, int], mask: int) -> float:
     by_start = defaultdict(list)
     for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
@@ -2330,6 +3616,31 @@ def affine_lower_bound_for_values(values_by_mask, t_values, selected_tokens):
     beta_values = np.array(result.x[1:], dtype=float)
     rhs_at_current = -float(result.fun)
     return alpha, beta_values, rhs_at_current
+
+
+def affine_lower_bound_for_budget_values(values_by_budget, t_values, selected_tokens):
+    current_budget = float(sum(float(t_values[token_idx]) for token_idx in selected_tokens))
+    objective = np.array([-1.0, -current_budget], dtype=float)
+    a_ub = []
+    b_ub = []
+    for budget, value in values_by_budget.items():
+        row = [1.0, float(budget)]
+        a_ub.append(row)
+        b_ub.append(float(value))
+
+    result = linprog(
+        c=objective,
+        A_ub=np.array(a_ub, dtype=float),
+        b_ub=np.array(b_ub, dtype=float),
+        bounds=[(None, None), (None, None)],
+        method="highs",
+    )
+    if not result.success:
+        return None
+    alpha = float(result.x[0])
+    beta = float(result.x[1])
+    rhs_at_current = -float(result.fun)
+    return alpha, beta, rhs_at_current
 
 
 def enumerate_short_path_token_sets(lp, word_idx: int, max_length: int, *, max_paths: int):
