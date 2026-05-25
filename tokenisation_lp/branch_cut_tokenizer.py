@@ -172,9 +172,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-word-pair-hull-max-pair-rows", type=int, default=250000)
     parser.add_argument("--short-word-pair-hull-max-pairs", type=int, default=800)
     parser.add_argument("--short-word-pair-hull-top-words-per-color", type=int, default=36)
+    parser.add_argument("--short-word-pair-hull-candidate-word-multiplier", type=float, default=1.0)
+    parser.add_argument("--short-word-pair-hull-candidate-top-words-multiplier", type=float, default=1.0)
     parser.add_argument("--short-word-pair-hull-workers", type=int, default=0)
     parser.add_argument("--short-word-pair-hull-batch-size", type=int, default=32)
     parser.add_argument("--short-word-pair-hull-min-fractional-shared-colors", type=int, default=1)
+    parser.add_argument("--short-word-pair-hull-cache-max-entries", type=int, default=500000)
+    parser.add_argument("--short-word-pair-hull-cache-value-quantum", type=float, default=1e-4)
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -450,9 +454,13 @@ def build_cut_config(args: argparse.Namespace) -> CutSeparationConfig:
         short_word_pair_hull_max_pair_rows=args.short_word_pair_hull_max_pair_rows,
         short_word_pair_hull_max_pairs=args.short_word_pair_hull_max_pairs,
         short_word_pair_hull_top_words_per_color=args.short_word_pair_hull_top_words_per_color,
+        short_word_pair_hull_candidate_word_multiplier=args.short_word_pair_hull_candidate_word_multiplier,
+        short_word_pair_hull_candidate_top_words_multiplier=args.short_word_pair_hull_candidate_top_words_multiplier,
         short_word_pair_hull_workers=args.short_word_pair_hull_workers,
         short_word_pair_hull_batch_size=args.short_word_pair_hull_batch_size,
         short_word_pair_hull_min_fractional_shared_colors=args.short_word_pair_hull_min_fractional_shared_colors,
+        short_word_pair_hull_cache_max_entries=args.short_word_pair_hull_cache_max_entries,
+        short_word_pair_hull_cache_value_quantum=args.short_word_pair_hull_cache_value_quantum,
     )
 
 

@@ -5,10 +5,11 @@ import os
 import logging
 import time
 import hashlib
+import math
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import combinations
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -49,9 +50,18 @@ class CutSeparationConfig:
     short_word_pair_hull_max_pair_rows: int = 250000
     short_word_pair_hull_max_pairs: int = 800
     short_word_pair_hull_top_words_per_color: int = 36
+    short_word_pair_hull_candidate_word_multiplier: float = 1.0
+    short_word_pair_hull_candidate_top_words_multiplier: float = 1.0
     short_word_pair_hull_workers: int = 0
     short_word_pair_hull_batch_size: int = 32
     short_word_pair_hull_min_fractional_shared_colors: int = 1
+    short_word_pair_hull_cache_max_entries: int = 500000
+    short_word_pair_hull_cache_value_quantum: float = 1e-4
+    short_word_pair_hull_solution_cache: dict[str, dict | None] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -855,10 +865,15 @@ def separate_cuts(
                 max_pair_rows=config.short_word_pair_hull_max_pair_rows,
                 max_pairs=config.short_word_pair_hull_max_pairs,
                 top_words_per_color=config.short_word_pair_hull_top_words_per_color,
+                candidate_word_multiplier=config.short_word_pair_hull_candidate_word_multiplier,
+                candidate_top_words_multiplier=config.short_word_pair_hull_candidate_top_words_multiplier,
                 max_paths=config.word_support_max_paths,
                 workers=config.short_word_pair_hull_workers,
                 batch_size=config.short_word_pair_hull_batch_size,
                 min_fractional_shared_colors=config.short_word_pair_hull_min_fractional_shared_colors,
+                solution_cache=config.short_word_pair_hull_solution_cache,
+                solution_cache_max_entries=config.short_word_pair_hull_cache_max_entries,
+                solution_cache_value_quantum=config.short_word_pair_hull_cache_value_quantum,
             )
         )
     if "group_value_deep" in family_set:
@@ -1727,7 +1742,11 @@ def init_pair_hull_worker(state):
 
 
 def pair_hull_worker(task):
-    left_word, right_word, selected_tokens = task
+    if len(task) == 4:
+        left_word, right_word, selected_tokens, cache_key = task
+    else:
+        left_word, right_word, selected_tokens = task
+        cache_key = None
     state = PAIR_HULL_WORKER_STATE
     lp = state["lp"]
     left_paths = state["paths_by_word"][left_word]
@@ -1745,7 +1764,7 @@ def pair_hull_worker(task):
         tolerance=state["tolerance"],
     )
     if cut is None:
-        return {"cut": None, "build_seconds": 0.0, "solve_seconds": 0.0}
+        return {"cut": None, "build_seconds": 0.0, "solve_seconds": 0.0, "cache_key": cache_key}
 
     violation, edge_coefficients, token_coefficients, rhs, coefficient_key, build_seconds, solve_seconds = cut
     num_f = lp["num_nonfree_edges"]
@@ -1762,11 +1781,80 @@ def pair_hull_worker(task):
         "cut": (violation, full_key, entries, rhs),
         "build_seconds": build_seconds,
         "solve_seconds": solve_seconds,
+        "cache_key": cache_key,
     }
 
 
 def pair_hull_batch_worker(tasks):
     return [pair_hull_worker(task) for task in tasks]
+
+
+def pair_hull_projection_cache_key(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    left_word: int,
+    right_word: int,
+    selected_tokens,
+    *,
+    value_quantum: float,
+):
+    """Key a pair-hull separator LP by structure and rounded projected LP values."""
+
+    num_f = lp["num_nonfree_edges"]
+    projected_values = []
+    for word_idx in (left_word, right_word):
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            projected_values.append(float(f_values[edge_idx]))
+        for edge_idx in lp["word_free_edges"].get(word_idx, []):
+            projected_values.append(float(g_values[edge_idx]))
+    token_values = [float(t_values[token_idx]) for token_idx in selected_tokens]
+
+    hasher = hashlib.sha256()
+    hasher.update(b"tokenizer-lp-pair-hull-projection-v1")
+    hasher.update(f"value_quantum={float(value_quantum):.17g}".encode("ascii"))
+    hash_array(hasher, np.asarray([left_word, right_word, num_f], dtype=np.int64))
+    hash_array(hasher, np.asarray(selected_tokens, dtype=np.int64))
+    hash_projected_values(hasher, projected_values, value_quantum=value_quantum)
+    hash_projected_values(hasher, token_values, value_quantum=value_quantum)
+    return hasher.hexdigest()
+
+
+def hash_projected_values(hasher, values, *, value_quantum: float) -> None:
+    values_array = np.asarray(values, dtype=np.float64)
+    if value_quantum > 0:
+        quantized = np.rint(values_array / float(value_quantum)).astype(np.int64)
+        hash_array(hasher, quantized)
+    else:
+        hash_array(hasher, values_array)
+
+
+def cut_violation_from_entries(lp, f_values, g_values, t_values, entries, rhs: float) -> float:
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+    lhs = 0.0
+    for col_idx, coefficient in entries:
+        if col_idx < num_f:
+            value = f_values[col_idx]
+        elif col_idx < t_offset:
+            value = g_values[col_idx - num_f]
+        else:
+            value = t_values[col_idx - t_offset]
+        lhs += float(coefficient) * float(value)
+    return lhs - float(rhs)
+
+
+def maybe_cache_pair_hull_result(
+    cache: dict[str, dict | None] | None,
+    cache_key: str | None,
+    result,
+    max_entries: int,
+) -> None:
+    if cache is None or cache_key is None or max_entries <= 0 or cache_key in cache or len(cache) >= max_entries:
+        return
+    cache[cache_key] = result
 
 
 def chunked(items, chunk_size: int):
@@ -2885,21 +2973,31 @@ def separate_short_word_pair_hull_cut_specs(
     max_pair_rows: int = 250000,
     max_pairs: int = 800,
     top_words_per_color: int = 36,
+    candidate_word_multiplier: float = 1.0,
+    candidate_top_words_multiplier: float = 1.0,
     max_paths: int = 100000,
     workers: int = 0,
     batch_size: int = 32,
     min_fractional_shared_colors: int = 1,
+    solution_cache: dict[str, dict | None] | None = None,
+    solution_cache_max_entries: int = 500000,
+    solution_cache_value_quantum: float = 1e-4,
 ):
     """Separate full upward local-hull cuts for pairs of short words."""
 
     start_time = time.monotonic()
+    candidate_max_words = max(max_words, int(math.ceil(max_words * max(1.0, float(candidate_word_multiplier)))))
+    candidate_top_words_per_color = max(
+        top_words_per_color,
+        int(math.ceil(top_words_per_color * max(1.0, float(candidate_top_words_multiplier)))),
+    )
     pair_rows, word_color_scores = short_word_pair_candidates(
         lp,
         f_values,
         t_values,
-        max_words=max_words,
+        max_words=candidate_max_words,
         max_word_length=max_word_length,
-        top_words_per_color=top_words_per_color,
+        top_words_per_color=candidate_top_words_per_color,
         tolerance=tolerance,
     )
     if not pair_rows:
@@ -2909,12 +3007,21 @@ def separate_short_word_pair_hull_cut_specs(
     paths_by_word = {}
     colors_by_word = {}
     tasks = []
+    violations = []
     skipped_colors = 0
     skipped_paths = 0
     skipped_rows = 0
     skipped_shared = 0
+    cache_hits = 0
+    cache_cut_hits = 0
+    cache_no_cut_hits = 0
+    cache_full_skips = 0
 
-    for _, left_word, right_word in pair_rows[:max_pairs]:
+    solution_cache = solution_cache if solution_cache is not None and solution_cache_max_entries > 0 else None
+
+    for _, left_word, right_word in pair_rows:
+        if len(tasks) >= max_pairs:
+            break
         full_key_prefix = ("short_word_pair_hull", left_word, right_word)
         if any(key[:3] == full_key_prefix for key in existing_cut_keys):
             continue
@@ -2932,6 +3039,40 @@ def separate_short_word_pair_hull_cut_specs(
         if len(selected_tokens) < 2 or len(selected_tokens) > max_colors:
             skipped_colors += 1
             continue
+
+        cache_key = None
+        if solution_cache is not None:
+            cache_key = pair_hull_projection_cache_key(
+                lp,
+                f_values,
+                g_values,
+                t_values,
+                left_word,
+                right_word,
+                selected_tokens,
+                value_quantum=solution_cache_value_quantum,
+            )
+            if cache_key in solution_cache:
+                cache_hits += 1
+                cached = solution_cache[cache_key]
+                if cached is None or cached.get("cut") is None:
+                    cache_no_cut_hits += 1
+                else:
+                    cut = cached["cut"]
+                    current_violation = cut_violation_from_entries(
+                        lp,
+                        f_values,
+                        g_values,
+                        t_values,
+                        cut[2],
+                        cut[3],
+                    )
+                    if current_violation > tolerance and cut[1] not in existing_cut_keys:
+                        cache_cut_hits += 1
+                        violations.append((current_violation, cut[1], cut[2], cut[3]))
+                continue
+            if len(solution_cache) >= solution_cache_max_entries:
+                cache_full_skips += 1
 
         if left_word not in paths_by_word:
             paths_by_word[left_word] = enumerate_word_edge_paths_by_pattern(
@@ -2955,19 +3096,29 @@ def separate_short_word_pair_hull_cut_specs(
         if len(left_paths) * len(right_paths) > max_pair_rows:
             skipped_rows += 1
             continue
-        tasks.append((left_word, right_word, selected_tokens))
+        tasks.append((left_word, right_word, selected_tokens, cache_key))
 
     if not tasks:
         LOGGER.info(
-            "short_word_pair_hull: no tasks after filtering candidates=%d skipped_colors=%d "
-            "skipped_shared=%d skipped_paths=%d skipped_rows=%d",
+            "short_word_pair_hull: no tasks after filtering candidates=%d candidate_words=%d "
+            "candidate_top_words=%d skipped_colors=%d "
+            "skipped_shared=%d skipped_paths=%d skipped_rows=%d cache_hits=%d cached_cuts=%d "
+            "cached_no_cuts=%d cache_size=%d cache_full_skips=%d cache_value_quantum=%.6g",
             len(pair_rows),
+            candidate_max_words,
+            candidate_top_words_per_color,
             skipped_colors,
             skipped_shared,
             skipped_paths,
             skipped_rows,
+            cache_hits,
+            cache_cut_hits,
+            cache_no_cut_hits,
+            len(solution_cache) if solution_cache is not None else 0,
+            cache_full_skips,
+            solution_cache_value_quantum,
         )
-        return []
+        return violations
 
     worker_count = resolve_pair_hull_workers(workers)
     worker_state = {
@@ -2978,10 +3129,30 @@ def separate_short_word_pair_hull_cut_specs(
         "paths_by_word": paths_by_word,
         "tolerance": tolerance,
     }
-    violations = []
     checked = 0
     build_seconds = 0.0
     solve_seconds = 0.0
+    progress_interval = max(1, int(math.ceil(len(tasks) / 40)))
+    next_progress = progress_interval
+
+    def log_pair_hull_progress():
+        nonlocal next_progress
+        if checked < next_progress or checked >= len(tasks):
+            return
+        while next_progress <= checked:
+            next_progress += progress_interval
+        LOGGER.info(
+            "short_word_pair_hull progress: checked=%d/%d %.1f%% cuts=%d workers=%d "
+            "wall=%.3fs worker_build=%.3fs worker_solve=%.3fs",
+            checked,
+            len(tasks),
+            100.0 * checked / max(1, len(tasks)),
+            len(violations),
+            worker_count,
+            time.monotonic() - start_time,
+            build_seconds,
+            solve_seconds,
+        )
 
     if worker_count == 1:
         init_pair_hull_worker(worker_state)
@@ -2992,9 +3163,16 @@ def separate_short_word_pair_hull_cut_specs(
             checked += 1
             build_seconds += result["build_seconds"]
             solve_seconds += result["solve_seconds"]
+            maybe_cache_pair_hull_result(
+                solution_cache,
+                result.get("cache_key"),
+                result if result["cut"] is not None else None,
+                solution_cache_max_entries,
+            )
             cut = result["cut"]
             if cut is not None:
                 violations.append(cut)
+            log_pair_hull_progress()
     else:
         context = mp.get_context("fork") if hasattr(os, "fork") else None
         task_batches = list(chunked(tasks, batch_size))
@@ -3012,16 +3190,27 @@ def separate_short_word_pair_hull_cut_specs(
                     checked += 1
                     build_seconds += result["build_seconds"]
                     solve_seconds += result["solve_seconds"]
+                    maybe_cache_pair_hull_result(
+                        solution_cache,
+                        result.get("cache_key"),
+                        result if result["cut"] is not None else None,
+                        solution_cache_max_entries,
+                    )
                     cut = result["cut"]
                     if cut is not None:
                         violations.append(cut)
+                log_pair_hull_progress()
 
     elapsed = time.monotonic() - start_time
     LOGGER.info(
-        "short_word_pair_hull: candidates=%d tasks=%d checked=%d cuts=%d workers=%d "
+        "short_word_pair_hull: candidates=%d candidate_words=%d candidate_top_words=%d "
+        "tasks=%d checked=%d cuts=%d workers=%d "
         "batches=%d batch_size=%d wall=%.3fs worker_build=%.3fs worker_solve=%.3fs skipped_colors=%d "
-        "skipped_shared=%d skipped_paths=%d skipped_rows=%d patterns=%d",
+        "skipped_shared=%d skipped_paths=%d skipped_rows=%d cache_hits=%d cached_cuts=%d "
+        "cached_no_cuts=%d cache_size=%d cache_full_skips=%d cache_value_quantum=%.6g patterns=%d",
         len(pair_rows),
+        candidate_max_words,
+        candidate_top_words_per_color,
         len(tasks),
         checked,
         len(violations),
@@ -3035,6 +3224,12 @@ def separate_short_word_pair_hull_cut_specs(
         skipped_shared,
         skipped_paths,
         skipped_rows,
+        cache_hits,
+        cache_cut_hits,
+        cache_no_cut_hits,
+        len(solution_cache) if solution_cache is not None else 0,
+        cache_full_skips,
+        solution_cache_value_quantum,
         len(path_pattern_cache),
     )
     return violations

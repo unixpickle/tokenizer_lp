@@ -350,6 +350,25 @@ def parse_args() -> argparse.Namespace:
         help="Number of words per fractional colour used to propose short_word_pair_hull candidates.",
     )
     parser.add_argument(
+        "--lp-short-word-pair-hull-candidate-word-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier applied only to the pair candidate proposal word pool. "
+            "The solve budget remains --lp-short-word-pair-hull-max-pairs, so cache "
+            "hits can be spent on deeper candidates."
+        ),
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-candidate-top-words-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier applied only to the words-per-colour candidate proposal pool. "
+            "Use with the projection cache to explore more pair options."
+        ),
+    )
+    parser.add_argument(
         "--lp-short-word-pair-hull-workers",
         type=int,
         default=0,
@@ -368,6 +387,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Minimum number of shared fractional token colors required before testing a "
             "short_word_pair_hull candidate."
+        ),
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-cache-max-entries",
+        type=int,
+        default=500000,
+        help=(
+            "Maximum in-memory cache entries for identical short_word_pair_hull projected "
+            "separator LPs. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-cache-value-quantum",
+        type=float,
+        default=1e-4,
+        help=(
+            "Quantization step for projected LP values in the short_word_pair_hull cache. "
+            "Use 0 for exact-value cache keys."
         ),
     )
     return parser.parse_args()
@@ -409,9 +446,13 @@ def main() -> None:
         short_word_pair_hull_max_pair_rows=args.lp_short_word_pair_hull_max_pair_rows,
         short_word_pair_hull_max_pairs=args.lp_short_word_pair_hull_max_pairs,
         short_word_pair_hull_top_words_per_color=args.lp_short_word_pair_hull_top_words_per_color,
+        short_word_pair_hull_candidate_word_multiplier=args.lp_short_word_pair_hull_candidate_word_multiplier,
+        short_word_pair_hull_candidate_top_words_multiplier=args.lp_short_word_pair_hull_candidate_top_words_multiplier,
         short_word_pair_hull_workers=args.lp_short_word_pair_hull_workers,
         short_word_pair_hull_batch_size=args.lp_short_word_pair_hull_batch_size,
         short_word_pair_hull_min_fractional_shared_colors=args.lp_short_word_pair_hull_min_fractional_shared_colors,
+        short_word_pair_hull_cache_max_entries=args.lp_short_word_pair_hull_cache_max_entries,
+        short_word_pair_hull_cache_value_quantum=args.lp_short_word_pair_hull_cache_value_quantum,
     )
 
     if args.kind in {"lp", "both"}:

@@ -1900,3 +1900,186 @@ Result:
 The seeded incumbent remained best at `265,039` tokens. This run was only a
 functionality smoke with no root cleanup cuts and no node cut separation; it
 verifies that the branch search now produces and persists a usable tokenizer.
+
+### Pair-Hull Projection Cache
+
+I added an in-memory cache for `short_word_pair_hull` separator solves. The
+cache key is the pair-hull ILP structure plus rounded projected LP values for
+the two words' local edge variables and the selected token variables. The
+default rounding quantum is `1e-4`; set
+`--lp-short-word-pair-hull-cache-value-quantum 0` for exact-value keys. Cached
+no-cut results are skipped in later separation calls, and `max_pairs` now
+counts new uncached pair solves instead of candidate rank positions, so later
+iterations can move deeper into the candidate list.
+
+Cached cuts are rechecked against the current LP point before they are returned,
+so rounded reuse cannot add an invalid or currently nonviolated cut. Cached
+no-cut entries are a separation heuristic: they can skip a nearby projection
+that might have become weakly violated, but they only reduce search effort and
+do not affect LP validity.
+
+Targeted books check:
+
+```text
+round 0: candidates=9259 tasks=2 checked=2 cuts=0 cache_hits=0 cache_size=2
+round 1: candidates=9259 tasks=2 checked=2 cuts=0 cache_hits=2 cached_no_cuts=2 cache_size=4
+```
+
+The second identical separation call reused the first two no-cut answers and
+then spent its two-task solve budget on two different candidate pairs.
+
+Partial exact-cache 40k-pair run:
+
+| Pair Round | Candidates | Tasks | Cuts | Wall | Cache Hits | Cache Size |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 18,985 | 18,613 | 192 | 1,066.858s | 0 | 18,613 |
+| 2 | 21,076 | 20,418 | 65 | 1,365.138s | 2 | 39,031 |
+
+The exact-value cache barely reused across iterations because the projected LP
+values changed after new cuts. I stopped that run and switched the default to
+rounded keys.
+
+Rounded-cache smoke with a `2e-5` perturbation and `1e-4` quantum:
+
+```text
+round 0: tasks=2 checked=2 cuts=0 cache_hits=0 cache_size=2
+round 1: tasks=2 checked=2 cuts=2 cache_hits=2 cached_no_cuts=2 cache_size=4
+```
+
+The rounded cache skipped the two near-duplicate no-cut candidates and spent
+the two-task solve budget on later pair candidates, which found two cuts in
+this diagnostic.
+
+### 40k Pair Rounded-Cache Books Run
+
+I reran the 40k-pair books configuration with
+`--lp-short-word-pair-hull-cache-value-quantum 1e-4`.
+
+Command output:
+
+| artifact | path |
+|---|---|
+| run log | `/tmp/tokenizer_lp_books_40k_pair_rounded_cache/run.log` |
+| best rounded tokenizer | `/tmp/tokenizer_lp_books_40k_pair_rounded_cache/lp/best_so_far_tokenizer.json` |
+| best metadata | `/tmp/tokenizer_lp_books_40k_pair_rounded_cache/lp/best_so_far_metadata.json` |
+| final rounded tokenizer | `/tmp/tokenizer_lp_books_40k_pair_rounded_cache/lp/lp_dp_tokenizer.json` |
+
+Iteration summary:
+
+| Iteration | Lower Bound | Fractional Colors | Active Cuts | Next Cuts | Rounded Tokens |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 258,417.000 | 288 | 0 | 38 | 268,378 |
+| 1 | 258,431.750 | 287 | 38 | 4 | 268,378 |
+| 2 | 258,431.750 | 287 | 42 | 192 | 268,378 |
+| 3 | 258,670.854 | 322 | 234 | 2 | 266,327 |
+| 4 | 258,671.104 | 322 | 236 | 65 | 266,327 |
+| 5 | 258,698.563 | 325 | 301 | 5 | 265,039 |
+| 6 | 258,700.563 | 325 | 306 | 0 | 269,956 |
+
+Pair-separation rounds:
+
+| LP Iteration | Candidate Pairs | New Tasks | Pair Cuts | Cache Hits | Cache Size | Wall Time |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 18,985 | 18,613 | 192 | 0 | 18,613 | 1,070.916s |
+| 4 | 21,076 | 20,173 | 65 | 247 | 38,786 | 1,374.750s |
+| 5 | 20,819 | 9,689 | 5 | 10,413 | 48,475 | 837.144s |
+| 6 | 20,781 | 491 | 0 | 19,567 | 48,966 | 74.425s |
+
+Comparison:
+
+| Setting | Final Bound | Best Rounded Tokens | Wall Time |
+|---|---:|---:|---:|
+| 40k pair search, no projection cache | 258,700.563 | 265,039 | 5,538.38s |
+| 40k pair search, `1e-4` rounded projection cache | 258,700.563 | 265,039 | 3,749.75s |
+
+The rounded cache did not change the final bound or the best rounded tokenizer
+on this run. It did substantially cut late-round separation work, especially
+the final zero-cut pass (`1,337.812s` before, `74.425s` with the rounded
+cache). The middle rounds still spent real time on new candidates and found the
+same cuts as the uncached run.
+
+### Wider Pair Search With Progress Logging
+
+I added periodic `short_word_pair_hull progress` logging during the
+multiprocess pair-hull checker. The separator now logs roughly every 2.5% of
+submitted tasks with checked count, percent complete, cuts found so far, wall
+time, and accumulated worker build/solve time. This makes long pair-hull
+passes observable without interrupting the run.
+
+Current in-progress books run:
+
+```bash
+/usr/bin/time -p uv run tokenizer-lp-train \
+  --data-dir ~/Desktop/books \
+  --vocab-size 512 \
+  --kind lp \
+  --output-dir /tmp/tokenizer_lp_books_80k_pair_rounded_cache_wider_progress \
+  --max-token-length 8 \
+  --min-token-count 5 \
+  --pretokenizer nanochat \
+  --eval-workers 2 \
+  --lp-cut-rounds 12 \
+  --lp-cuts-per-round 1000 \
+  --lp-cut-families short_word_full_hull,short_word_pair_hull \
+  --lp-short-word-full-hull-max-words 12000 \
+  --lp-short-word-full-hull-max-length 12 \
+  --lp-short-word-full-hull-max-colors 96 \
+  --lp-short-word-pair-hull-max-words 700 \
+  --lp-short-word-pair-hull-max-length 12 \
+  --lp-short-word-pair-hull-max-colors 96 \
+  --lp-short-word-pair-hull-max-pair-rows 250000 \
+  --lp-short-word-pair-hull-max-pairs 80000 \
+  --lp-short-word-pair-hull-top-words-per-color 48 \
+  --lp-short-word-pair-hull-candidate-word-multiplier 4 \
+  --lp-short-word-pair-hull-candidate-top-words-multiplier 4 \
+  --lp-short-word-pair-hull-workers 8 \
+  --lp-short-word-pair-hull-batch-size 128 \
+  --lp-short-word-pair-hull-cache-value-quantum 1e-4 \
+  --lp-word-support-max-paths 100000 \
+  --lp-solver highspy \
+  --lp-solution-cache-dir /tmp/tokenizer_lp_solution_cache
+```
+
+Artifacts:
+
+| artifact | path |
+|---|---|
+| run log | `/tmp/tokenizer_lp_books_80k_pair_rounded_cache_wider_progress/run.log` |
+| best rounded tokenizer so far | `/tmp/tokenizer_lp_books_80k_pair_rounded_cache_wider_progress/lp/best_so_far_tokenizer.json` |
+
+Completed LP iterations so far:
+
+| Iteration | Lower Bound | Fractional Colors | Active Cuts | Next Cuts | Rounded Tokens |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 258,417.000 | 288 | 0 | 38 | 268,378 |
+| 1 | 258,431.750 | 287 | 38 | 4 | 268,378 |
+| 2 | 258,431.750 | 287 | 42 | 1,000 | 268,378 |
+| 3 | 258,773.295 | 337 | 1,042 | 4 | 262,807 |
+| 4 | 258,773.523 | 337 | 1,046 | 1,000 | 262,807 |
+| 5 | 258,948.917 | 335 | 2,046 | 661 | 261,571 |
+
+Completed pair-separation rounds so far:
+
+| LP Iteration | Candidate Pairs | Candidate Words | Top Words/Color | New Tasks | Pair Cuts | Cache Hits | Cache Size | Wall Time |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 386,658 | 2,800 | 192 | 80,000 | 3,731 | 0 | 80,000 | 13,321.197s |
+| 4 | 432,550 | 2,800 | 192 | 80,000 | 1,948 | 98 | 160,000 | 14,519.088s |
+| 5 | 422,449 | 2,800 | 192 | 80,000 | 661 | 145 | 240,000 | 15,062.342s |
+
+The next pair pass was still running when this note was written. Latest
+observed progress:
+
+```text
+short_word_pair_hull progress: checked=76032/80000 95.0% cuts=210 workers=8 wall=14821.846s
+```
+
+Interim comparison against the earlier rounded-cache 40k run:
+
+| Setting | Best Bound So Far | Best Rounded Tokens So Far |
+|---|---:|---:|
+| 40k pair search, `1e-4` rounded projection cache | 258,700.563 | 265,039 |
+| 80k pair search, 4x wider proposal pool, still running | 258,948.917 | 261,571 |
+
+This run is not complete yet, but the wider candidate pool is finding many more
+valid pair-hull cuts than the 40k setup and has already improved both the LP
+bound and the rounded tokenizer.
