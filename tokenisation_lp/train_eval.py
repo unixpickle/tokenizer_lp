@@ -369,6 +369,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--lp-short-word-pair-hull-candidate-strategy",
+        choices=("score", "mixed"),
+        default="score",
+        help=(
+            "Pair candidate ordering. 'score' uses the shared candidate score; 'mixed' takes "
+            "one quarter each from shared score, shared fractional-colour count, total "
+            "fractional-colour count, then shuffles the remaining pool."
+        ),
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-candidate-random-seed",
+        type=int,
+        default=0,
+        help="Random seed for the shuffled remainder of mixed pair candidate ordering.",
+    )
+    parser.add_argument(
         "--lp-short-word-pair-hull-workers",
         type=int,
         default=0,
@@ -448,6 +464,8 @@ def main() -> None:
         short_word_pair_hull_top_words_per_color=args.lp_short_word_pair_hull_top_words_per_color,
         short_word_pair_hull_candidate_word_multiplier=args.lp_short_word_pair_hull_candidate_word_multiplier,
         short_word_pair_hull_candidate_top_words_multiplier=args.lp_short_word_pair_hull_candidate_top_words_multiplier,
+        short_word_pair_hull_candidate_strategy=args.lp_short_word_pair_hull_candidate_strategy,
+        short_word_pair_hull_candidate_random_seed=args.lp_short_word_pair_hull_candidate_random_seed,
         short_word_pair_hull_workers=args.lp_short_word_pair_hull_workers,
         short_word_pair_hull_batch_size=args.lp_short_word_pair_hull_batch_size,
         short_word_pair_hull_min_fractional_shared_colors=args.lp_short_word_pair_hull_min_fractional_shared_colors,

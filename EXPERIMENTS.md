@@ -2006,7 +2006,7 @@ submitted tasks with checked count, percent complete, cuts found so far, wall
 time, and accumulated worker build/solve time. This makes long pair-hull
 passes observable without interrupting the run.
 
-Current in-progress books run:
+Books run:
 
 ```bash
 /usr/bin/time -p uv run tokenizer-lp-train \
@@ -2045,9 +2045,9 @@ Artifacts:
 | artifact | path |
 |---|---|
 | run log | `/tmp/tokenizer_lp_books_80k_pair_rounded_cache_wider_progress/run.log` |
-| best rounded tokenizer so far | `/tmp/tokenizer_lp_books_80k_pair_rounded_cache_wider_progress/lp/best_so_far_tokenizer.json` |
+| best rounded tokenizer | `/tmp/tokenizer_lp_books_80k_pair_rounded_cache_wider_progress/lp/best_so_far_tokenizer.json` |
 
-Completed LP iterations so far:
+Completed LP iterations:
 
 | Iteration | Lower Bound | Fractional Colors | Active Cuts | Next Cuts | Rounded Tokens |
 |---:|---:|---:|---:|---:|---:|
@@ -2057,29 +2057,119 @@ Completed LP iterations so far:
 | 3 | 258,773.295 | 337 | 1,042 | 4 | 262,807 |
 | 4 | 258,773.523 | 337 | 1,046 | 1,000 | 262,807 |
 | 5 | 258,948.917 | 335 | 2,046 | 661 | 261,571 |
+| 6 | 258,989.231 | 339 | 2,707 | 215 | 260,681 |
 
-Completed pair-separation rounds so far:
+Completed pair-separation rounds:
 
 | LP Iteration | Candidate Pairs | Candidate Words | Top Words/Color | New Tasks | Pair Cuts | Cache Hits | Cache Size | Wall Time |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 2 | 386,658 | 2,800 | 192 | 80,000 | 3,731 | 0 | 80,000 | 13,321.197s |
 | 4 | 432,550 | 2,800 | 192 | 80,000 | 1,948 | 98 | 160,000 | 14,519.088s |
 | 5 | 422,449 | 2,800 | 192 | 80,000 | 661 | 145 | 240,000 | 15,062.342s |
+| 6 | 428,883 | 2,800 | 192 | 80,000 | 215 | 86 | 320,000 | 15,307.583s |
 
-The next pair pass was still running when this note was written. Latest
-observed progress:
-
-```text
-short_word_pair_hull progress: checked=76032/80000 95.0% cuts=210 workers=8 wall=14821.846s
-```
+I stopped this run after iteration 6 to try a cheaper, more diverse pair
+candidate schedule. The last 80k pass still found 215 valid cuts, but the
+per-pass cost was about 4.25 hours wall time and the rounded gap had already
+fallen to 0.649%.
 
 Interim comparison against the earlier rounded-cache 40k run:
 
 | Setting | Best Bound So Far | Best Rounded Tokens So Far |
 |---|---:|---:|
 | 40k pair search, `1e-4` rounded projection cache | 258,700.563 | 265,039 |
-| 80k pair search, 4x wider proposal pool, still running | 258,948.917 | 261,571 |
+| 80k pair search, 4x wider proposal pool, stopped after iter 6 | 258,989.231 | 260,681 |
 
-This run is not complete yet, but the wider candidate pool is finding many more
-valid pair-hull cuts than the 40k setup and has already improved both the LP
-bound and the rounded tokenizer.
+This stopped run found many more valid pair-hull cuts than the 40k setup and
+improved both the LP bound and the rounded tokenizer before it was interrupted.
+
+### Mixed 5k Pair Candidate Search
+
+I added an alternate `short_word_pair_hull` candidate ordering strategy:
+`--lp-short-word-pair-hull-candidate-strategy mixed`. The mixed strategy
+deduplicates candidates from four sources:
+
+- 25% from the standard shared candidate score.
+- 25% from shared fractional color count.
+- 25% from total fractional color count across the pair.
+- the remaining pool in deterministic random order.
+
+The random order uses `--lp-short-word-pair-hull-candidate-random-seed` as a
+base seed and adds `1_000_003 * separation_round`, so the shuffled remainder
+changes across LP separation rounds. Pair summaries log the effective
+`candidate_seed`.
+
+Current run:
+
+```bash
+/usr/bin/time -p uv run tokenizer-lp-train \
+  --data-dir ~/Desktop/books \
+  --vocab-size 512 \
+  --kind lp \
+  --output-dir /tmp/tokenizer_lp_books_5k_pair_mixed_min2_roundshuffle \
+  --max-token-length 8 \
+  --min-token-count 5 \
+  --pretokenizer nanochat \
+  --eval-workers 2 \
+  --lp-cut-rounds 12 \
+  --lp-cuts-per-round 1000 \
+  --lp-cut-families short_word_full_hull,short_word_pair_hull \
+  --lp-short-word-full-hull-max-words 12000 \
+  --lp-short-word-full-hull-max-length 12 \
+  --lp-short-word-full-hull-max-colors 96 \
+  --lp-short-word-pair-hull-max-words 700 \
+  --lp-short-word-pair-hull-max-length 12 \
+  --lp-short-word-pair-hull-max-colors 96 \
+  --lp-short-word-pair-hull-max-pair-rows 250000 \
+  --lp-short-word-pair-hull-max-pairs 5000 \
+  --lp-short-word-pair-hull-top-words-per-color 48 \
+  --lp-short-word-pair-hull-candidate-word-multiplier 4 \
+  --lp-short-word-pair-hull-candidate-top-words-multiplier 4 \
+  --lp-short-word-pair-hull-candidate-strategy mixed \
+  --lp-short-word-pair-hull-candidate-random-seed 0 \
+  --lp-short-word-pair-hull-min-fractional-shared-colors 2 \
+  --lp-short-word-pair-hull-workers 8 \
+  --lp-short-word-pair-hull-batch-size 128 \
+  --lp-short-word-pair-hull-cache-value-quantum 1e-4 \
+  --lp-word-support-max-paths 100000 \
+  --lp-solver highspy \
+  --lp-solution-cache-dir /tmp/tokenizer_lp_solution_cache
+```
+
+Artifacts:
+
+| artifact | path |
+|---|---|
+| run log | `/tmp/tokenizer_lp_books_5k_pair_mixed_min2_roundshuffle/run.log` |
+| best rounded tokenizer so far | `/tmp/tokenizer_lp_books_5k_pair_mixed_min2_roundshuffle/lp/best_so_far_tokenizer.json` |
+
+Completed LP iterations so far:
+
+| Iteration | Lower Bound | Fractional Colors | Active Cuts | Next Cuts | Rounded Tokens |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 258,417.000 | 288 | 0 | 38 | 268,378 |
+| 1 | 258,431.750 | 287 | 38 | 4 | 268,378 |
+| 2 | 258,431.750 | 287 | 42 | 200 | 268,378 |
+| 3 | 258,567.181 | 312 | 242 | 4 | 265,478 |
+| 4 | 258,567.181 | 312 | 246 | 192 | 265,478 |
+| 5 | 258,630.667 | 317 | 438 | 1 | 266,630 |
+| 6 | 258,630.667 | 317 | 439 | 114 | 265,746 |
+| 7 | 258,679.792 | 321 | 553 | 81 | 264,308 |
+| 8 | 258,711.854 | 316 | 634 | 78 | 266,369 |
+
+Completed pair-separation rounds so far:
+
+| LP Iteration | Candidate Pairs | Candidate Seed | New Tasks | Pair Cuts | Skipped Shared | Cache Hits | Cache Size | Wall Time |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 386,658 | 2,000,006 | 5,000 | 200 | 11,170 | 0 | 5,000 | 1,189.444s |
+| 4 | 409,948 | 4,000,012 | 5,000 | 192 | 11,309 | 17 | 10,000 | 1,244.048s |
+| 6 | 407,235 | 6,000,018 | 5,000 | 114 | 11,876 | 33 | 15,000 | 1,184.115s |
+| 7 | 407,832 | 7,000,021 | 5,000 | 81 | 12,581 | 385 | 20,000 | 1,211.087s |
+| 8 | 406,421 | 8,000,024 | 5,000 | 78 | 14,380 | 758 | 25,000 | 1,225.687s |
+
+This run uses `--lp-short-word-pair-hull-min-fractional-shared-colors 2`, so
+single-shared-color pairs are filtered before hull solving. The skipped-shared
+counts show that the mixed candidate list is pushing far enough into the pool
+to discard many low-shared candidates while still filling the 5k solve budget.
+At the current point, the mixed 5k run has not caught the 80k run's bound, but
+it is much cheaper per pair-separation round and continues to find cuts.

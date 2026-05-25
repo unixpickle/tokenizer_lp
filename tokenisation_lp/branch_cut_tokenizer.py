@@ -174,6 +174,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-word-pair-hull-top-words-per-color", type=int, default=36)
     parser.add_argument("--short-word-pair-hull-candidate-word-multiplier", type=float, default=1.0)
     parser.add_argument("--short-word-pair-hull-candidate-top-words-multiplier", type=float, default=1.0)
+    parser.add_argument(
+        "--short-word-pair-hull-candidate-strategy",
+        choices=("score", "mixed"),
+        default="score",
+    )
+    parser.add_argument("--short-word-pair-hull-candidate-random-seed", type=int, default=0)
     parser.add_argument("--short-word-pair-hull-workers", type=int, default=0)
     parser.add_argument("--short-word-pair-hull-batch-size", type=int, default=32)
     parser.add_argument("--short-word-pair-hull-min-fractional-shared-colors", type=int, default=1)
@@ -456,6 +462,8 @@ def build_cut_config(args: argparse.Namespace) -> CutSeparationConfig:
         short_word_pair_hull_top_words_per_color=args.short_word_pair_hull_top_words_per_color,
         short_word_pair_hull_candidate_word_multiplier=args.short_word_pair_hull_candidate_word_multiplier,
         short_word_pair_hull_candidate_top_words_multiplier=args.short_word_pair_hull_candidate_top_words_multiplier,
+        short_word_pair_hull_candidate_strategy=args.short_word_pair_hull_candidate_strategy,
+        short_word_pair_hull_candidate_random_seed=args.short_word_pair_hull_candidate_random_seed,
         short_word_pair_hull_workers=args.short_word_pair_hull_workers,
         short_word_pair_hull_batch_size=args.short_word_pair_hull_batch_size,
         short_word_pair_hull_min_fractional_shared_colors=args.short_word_pair_hull_min_fractional_shared_colors,

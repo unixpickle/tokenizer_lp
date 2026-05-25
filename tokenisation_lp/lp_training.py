@@ -6,6 +6,7 @@ import logging
 import time
 import hashlib
 import math
+import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import combinations
 from collections import Counter, defaultdict
@@ -52,6 +53,8 @@ class CutSeparationConfig:
     short_word_pair_hull_top_words_per_color: int = 36
     short_word_pair_hull_candidate_word_multiplier: float = 1.0
     short_word_pair_hull_candidate_top_words_multiplier: float = 1.0
+    short_word_pair_hull_candidate_strategy: str = "score"
+    short_word_pair_hull_candidate_random_seed: int = 0
     short_word_pair_hull_workers: int = 0
     short_word_pair_hull_batch_size: int = 32
     short_word_pair_hull_min_fractional_shared_colors: int = 1
@@ -304,6 +307,7 @@ def solve_lp_vocabulary(
                 tolerance=cut_tolerance,
                 families=cut_families,
                 config=cut_config,
+                separation_round=iteration,
             )
             added_cuts = len(cut_keys)
 
@@ -640,6 +644,7 @@ def separate_cuts(
     tolerance: float,
     families: tuple[str, ...],
     config: CutSeparationConfig | None = None,
+    separation_round: int = 0,
 ):
     if max_cuts <= 0:
         return None, np.array([], dtype=float), [], 0.0
@@ -867,6 +872,8 @@ def separate_cuts(
                 top_words_per_color=config.short_word_pair_hull_top_words_per_color,
                 candidate_word_multiplier=config.short_word_pair_hull_candidate_word_multiplier,
                 candidate_top_words_multiplier=config.short_word_pair_hull_candidate_top_words_multiplier,
+                candidate_strategy=config.short_word_pair_hull_candidate_strategy,
+                candidate_random_seed=config.short_word_pair_hull_candidate_random_seed + 1_000_003 * separation_round,
                 max_paths=config.word_support_max_paths,
                 workers=config.short_word_pair_hull_workers,
                 batch_size=config.short_word_pair_hull_batch_size,
@@ -1725,6 +1732,80 @@ def short_word_pair_candidates(
             reverse=True,
         )
     ], word_color_scores
+
+
+def reorder_short_word_pair_candidates(
+    pair_rows,
+    lp,
+    t_values,
+    *,
+    max_pairs: int,
+    tolerance: float,
+    strategy: str,
+    random_seed: int,
+):
+    if strategy == "score":
+        return pair_rows
+    if strategy != "mixed":
+        raise ValueError(f"Unsupported short_word_pair_hull candidate strategy {strategy!r}")
+
+    fractional_colors = set(np.flatnonzero((t_values > tolerance) & (t_values < 1.0 - tolerance)))
+    colors_by_word = {}
+    enriched = []
+    for score, left_word, right_word in pair_rows:
+        left_colors = colors_by_word.setdefault(left_word, set(all_word_token_colors(lp, left_word)))
+        right_colors = colors_by_word.setdefault(right_word, set(all_word_token_colors(lp, right_word)))
+        shared_fractional_count = len((left_colors & right_colors) & fractional_colors)
+        fractional_count = len((left_colors | right_colors) & fractional_colors)
+        enriched.append(
+            {
+                "row": (score, left_word, right_word),
+                "score": score,
+                "shared_fractional_count": shared_fractional_count,
+                "fractional_count": fractional_count,
+            }
+        )
+
+    quota = max(1, int(math.ceil(max_pairs / 4)))
+    selected = []
+    selected_keys = set()
+
+    def add_rows(rows):
+        for row in rows:
+            _, left_word, right_word = row["row"]
+            key = (left_word, right_word)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            selected.append(row["row"])
+
+    add_rows(
+        sorted(
+            enriched,
+            key=lambda item: (item["score"], item["shared_fractional_count"], item["fractional_count"]),
+            reverse=True,
+        )[:quota]
+    )
+    add_rows(
+        sorted(
+            enriched,
+            key=lambda item: (item["shared_fractional_count"], item["score"], item["fractional_count"]),
+            reverse=True,
+        )[:quota]
+    )
+    add_rows(
+        sorted(
+            enriched,
+            key=lambda item: (item["fractional_count"], item["score"], item["shared_fractional_count"]),
+            reverse=True,
+        )[:quota]
+    )
+
+    remaining = [row["row"] for row in enriched if (row["row"][1], row["row"][2]) not in selected_keys]
+    rng = random.Random(random_seed)
+    rng.shuffle(remaining)
+    selected.extend(remaining)
+    return selected
 
 
 def resolve_pair_hull_workers(workers: int) -> int:
@@ -2975,6 +3056,8 @@ def separate_short_word_pair_hull_cut_specs(
     top_words_per_color: int = 36,
     candidate_word_multiplier: float = 1.0,
     candidate_top_words_multiplier: float = 1.0,
+    candidate_strategy: str = "score",
+    candidate_random_seed: int = 0,
     max_paths: int = 100000,
     workers: int = 0,
     batch_size: int = 32,
@@ -2999,6 +3082,15 @@ def separate_short_word_pair_hull_cut_specs(
         max_word_length=max_word_length,
         top_words_per_color=candidate_top_words_per_color,
         tolerance=tolerance,
+    )
+    pair_rows = reorder_short_word_pair_candidates(
+        pair_rows,
+        lp,
+        t_values,
+        max_pairs=max_pairs,
+        tolerance=tolerance,
+        strategy=candidate_strategy,
+        random_seed=candidate_random_seed,
     )
     if not pair_rows:
         return []
@@ -3101,12 +3193,14 @@ def separate_short_word_pair_hull_cut_specs(
     if not tasks:
         LOGGER.info(
             "short_word_pair_hull: no tasks after filtering candidates=%d candidate_words=%d "
-            "candidate_top_words=%d skipped_colors=%d "
+            "candidate_top_words=%d candidate_strategy=%s candidate_seed=%d skipped_colors=%d "
             "skipped_shared=%d skipped_paths=%d skipped_rows=%d cache_hits=%d cached_cuts=%d "
             "cached_no_cuts=%d cache_size=%d cache_full_skips=%d cache_value_quantum=%.6g",
             len(pair_rows),
             candidate_max_words,
             candidate_top_words_per_color,
+            candidate_strategy,
+            candidate_random_seed,
             skipped_colors,
             skipped_shared,
             skipped_paths,
@@ -3204,13 +3298,15 @@ def separate_short_word_pair_hull_cut_specs(
     elapsed = time.monotonic() - start_time
     LOGGER.info(
         "short_word_pair_hull: candidates=%d candidate_words=%d candidate_top_words=%d "
-        "tasks=%d checked=%d cuts=%d workers=%d "
+        "candidate_strategy=%s candidate_seed=%d tasks=%d checked=%d cuts=%d workers=%d "
         "batches=%d batch_size=%d wall=%.3fs worker_build=%.3fs worker_solve=%.3fs skipped_colors=%d "
         "skipped_shared=%d skipped_paths=%d skipped_rows=%d cache_hits=%d cached_cuts=%d "
         "cached_no_cuts=%d cache_size=%d cache_full_skips=%d cache_value_quantum=%.6g patterns=%d",
         len(pair_rows),
         candidate_max_words,
         candidate_top_words_per_color,
+        candidate_strategy,
+        candidate_random_seed,
         len(tasks),
         checked,
         len(violations),
