@@ -2173,3 +2173,50 @@ counts show that the mixed candidate list is pushing far enough into the pool
 to discard many low-shared candidates while still filling the 5k solve budget.
 At the current point, the mixed 5k run has not caught the 80k run's bound, but
 it is much cheaper per pair-separation round and continues to find cuts.
+
+### Mixed 5k Pair Candidate Search, 100-Round Attempt
+
+I reran the mixed 5k setup with `--lp-cut-rounds 100` and the same 4x candidate
+pool multipliers. The run was later interrupted to start the 8x candidate-pool
+variant, but it completed 63 LP iterations and gives a useful view of diminishing
+returns from repeated cheap pair passes.
+
+Artifacts:
+
+| artifact | path |
+|---|---|
+| run log | `/tmp/tokenizer_lp_books_5k_pair_mixed_min2_roundshuffle_100/run.log` |
+| best rounded tokenizer | `/tmp/tokenizer_lp_books_5k_pair_mixed_min2_roundshuffle_100/lp/best_so_far_tokenizer.json` |
+| bound plot | `experiments/plots/books_5k_pair_mixed_min2_roundshuffle_100_bounds.png` |
+
+![Mixed 5k pair 100-round bounds](experiments/plots/books_5k_pair_mixed_min2_roundshuffle_100_bounds.png)
+
+Summary:
+
+| Metric | Value |
+|---|---:|
+| completed LP iterations | 63 |
+| final completed iteration | 62 |
+| final lower bound | 259,005.154 |
+| final rounded tokens | 260,923 |
+| best rounded tokens | 260,642 |
+| best rounded iteration | 52 |
+| final fractional colors | 335 |
+| final active cuts | 1,796 |
+| final next cuts | 4 |
+| final rounded gap | 0.7350% |
+
+The bound continued to increase late in the run, but by iteration 62 the gains
+were small: the lower bound had moved only about 4.67 tokens over the last nine
+completed iterations. The rounded tokenizer also had noise across iterations;
+the best rounded result was 260,642 tokens at iteration 52, while the last
+completed rounded tokenizer was 260,923 tokens.
+
+I added `tokenizer-lp-plot-log-bounds` to make this plot reproducible from any
+training log:
+
+```bash
+uv run tokenizer-lp-plot-log-bounds \
+  /tmp/tokenizer_lp_books_5k_pair_mixed_min2_roundshuffle_100/run.log \
+  --output experiments/plots/books_5k_pair_mixed_min2_roundshuffle_100_bounds.png
+```

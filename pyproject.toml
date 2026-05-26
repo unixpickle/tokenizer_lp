@@ -8,11 +8,13 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
     "highspy>=1.8",
+    "matplotlib>=3.8",
     "tokenizers>=0.19",
 ]
 
 [project.scripts]
 tokenizer-lp-train = "tokenisation_lp.train_eval:main"
+tokenizer-lp-plot-log-bounds = "tokenisation_lp.plot_log_bounds:main"
 tokenizer-lp-branch-split = "tokenisation_lp.branch_split_lp:main"
 tokenizer-lp-branch-cut-tokenizer = "tokenisation_lp.branch_cut_tokenizer:main"
 tokenizer-lp-subset-hulls = "tokenisation_lp.subset_hull_diagnostics:main"
