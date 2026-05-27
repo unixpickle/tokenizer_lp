@@ -32,12 +32,30 @@ def train_and_eval_lp(
     cut_config: CutSeparationConfig,
     lp_solution_cache_dir: str | None,
     lp_solver: str,
+    resume: bool,
 ):
     saw_iteration = False
     best_tokens = None
     best_iteration = None
     lp_output_dir = output_dir / "lp"
     iteration_dir = lp_output_dir / "iterations"
+    best_metadata_path = lp_output_dir / "best_so_far_metadata.json"
+    if resume and best_metadata_path.exists():
+        try:
+            best_metadata = json.loads(best_metadata_path.read_text(encoding="utf-8"))
+            best_tokens = best_metadata.get("best_tokens")
+            best_iteration = best_metadata.get("best_iteration")
+            if best_tokens is not None:
+                best_tokens = int(best_tokens)
+            if best_iteration is not None:
+                best_iteration = int(best_iteration)
+            LOGGER.info(
+                "Loaded previous LP best-so-far metadata: iteration=%s tokens=%s",
+                best_iteration,
+                best_tokens,
+            )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            LOGGER.warning("Ignoring unreadable LP best-so-far metadata %s: %s", best_metadata_path, exc)
 
     def on_iteration(iteration, tokenizer):
         nonlocal saw_iteration, best_tokens, best_iteration
@@ -88,11 +106,12 @@ def train_and_eval_lp(
             "gap_fraction": gap_fraction,
             "fractional_colors": iteration.fractional_colors,
             "active_cuts": iteration.total_cuts,
-            "next_cuts": iteration.added_cuts,
-            "max_cut_violation": iteration.max_violation,
             "best_iteration": best_iteration,
             "best_tokens": best_tokens,
         }
+        if iteration.added_cuts >= 0:
+            metadata["next_cuts"] = iteration.added_cuts
+            metadata["max_cut_violation"] = iteration.max_violation
         (iteration_dir / f"lp_iteration_{iteration.iteration:03d}_metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n",
             encoding="utf-8",
@@ -118,6 +137,7 @@ def train_and_eval_lp(
         cut_config=cut_config,
         lp_solution_cache_dir=lp_solution_cache_dir,
         lp_solver=lp_solver,
+        resume=resume,
         iteration_callback=on_iteration,
     )
     if not saw_iteration:
@@ -243,7 +263,9 @@ def parse_args() -> argparse.Namespace:
             "boundary,word_packing,global_token_packing,global_pair_packing,global_triple_packing,"
             "global_rank_count,word_rank_count,word_rank_length,path_config,path_multicover,path_min_cover,group_value,"
             "threshold_value,group_budget_value,word_hull,short_word_hull,short_word_full_hull,"
-            "short_word_pair_hull,group_value_deep,"
+            "short_word_pair_hull,short_word_pair_single_chain,short_word_pair_bridge_chain,"
+            "short_word_pair_chains,short_word_triple_hull,short_word_triple_triangle,"
+            "short_word_triple_4cycle,group_value_deep,"
             "conflict_clique,conflict_odd_cycle,word_support,bad_vocab_escape,"
             "bad_vocab_improvement,window_overlap,window_overlap_deep,word_path_cover,window_pair."
         ),
@@ -258,6 +280,11 @@ def parse_args() -> argparse.Namespace:
         choices=("highspy", "scipy"),
         default="highspy",
         help="LP solver backend. highspy keeps a simplex model alive for iterative cut warm starts.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not load existing LP training checkpoints from --output-dir.",
     )
     parser.add_argument(
         "--lp-word-support-max-words",
@@ -370,10 +397,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lp-short-word-pair-hull-candidate-strategy",
-        choices=("score", "mixed"),
+        choices=("score", "mixed", "random"),
         default="score",
         help=(
-            "Pair candidate ordering. 'score' uses the shared candidate score; 'mixed' takes "
+            "Pair candidate ordering. 'score' uses the shared candidate score; 'random' shuffles "
+            "the full proposed pool; 'mixed' takes "
             "one quarter each from shared score, shared fractional-colour count, total "
             "fractional-colour count, then shuffles the remaining pool."
         ),
@@ -383,6 +411,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Random seed for the shuffled remainder of mixed pair candidate ordering.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-hull-pruning",
+        choices=("full", "fractional_edges_shared_colors"),
+        default="full",
+        help=(
+            "Coefficient pruning for short_word_pair_hull. "
+            "'fractional_edges_shared_colors' keeps shared fractional token colours, "
+            "currently fractional edge coefficients, deduplicates reduced rows, and applies "
+            "--lp-short-word-pair-hull-max-pair-rows after reduction."
+        ),
     )
     parser.add_argument(
         "--lp-short-word-pair-hull-workers",
@@ -422,6 +461,160 @@ def parse_args() -> argparse.Namespace:
             "Quantization step for projected LP values in the short_word_pair_hull cache. "
             "Use 0 for exact-value cache keys."
         ),
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-max-words",
+        type=int,
+        default=700,
+        help="Maximum short word types scanned by direct pair chain template separators.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-max-length",
+        type=int,
+        default=12,
+        help="Maximum pretokenized byte length scanned by direct pair chain template separators.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-candidate-word-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to the direct pair chain template word pool.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-top-supports-per-shape",
+        type=int,
+        default=24,
+        help="Maximum word supports retained per token-pair shape for direct pair chain templates.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-max-chain-edges",
+        type=int,
+        default=6,
+        help="Maximum consecutive overlapping edge-chain length used by direct pair chain templates.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-max-cuts",
+        type=int,
+        default=100000,
+        help="Maximum validated pair chain template cuts retained per family before global cut selection.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-max-words",
+        type=int,
+        default=700,
+        help="Maximum short word types used to propose short_word_triple_hull triples.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-max-length",
+        type=int,
+        default=12,
+        help="Maximum pretokenized byte length used by the short_word_triple_hull separator.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-max-rows",
+        type=int,
+        default=200000,
+        help="Maximum projected path-triple constraints allowed for one short_word_triple_hull LP.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-max-triples",
+        type=int,
+        default=30000,
+        help="Maximum candidate word triples tested by short_word_triple_hull per separation round.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-top-words-per-color",
+        type=int,
+        default=48,
+        help="Number of words per fractional colour used to propose short_word_triple_hull candidates.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-candidate-word-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied only to the triple candidate proposal word pool.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-candidate-top-words-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied only to the triple words-per-colour candidate proposal pool.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-candidate-sample",
+        type=int,
+        default=250000,
+        help="Number of shuffled triple candidates sampled before per-round filtering.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-candidate-random-seed",
+        type=int,
+        default=0,
+        help="Random seed for shuffled short_word_triple_hull candidates.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-token-mode",
+        choices=("shared_all", "at_least_two"),
+        default="at_least_two",
+        help="Fractional colors kept by short_word_triple_hull.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-min-fractional-colors",
+        type=int,
+        default=2,
+        help="Minimum selected fractional token colors required before testing a triple.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-workers",
+        type=int,
+        default=0,
+        help="Worker processes for short_word_triple_hull separation. Use 0 for cpu_count-1.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-hull-batch-size",
+        type=int,
+        default=32,
+        help="Candidate triples submitted per worker task for short_word_triple_hull multiprocessing.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-max-words",
+        type=int,
+        default=700,
+        help="Maximum short word types scanned by direct standard triplet template separators.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-max-length",
+        type=int,
+        default=12,
+        help="Maximum pretokenized byte length scanned by direct standard triplet template separators.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-candidate-word-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to the direct standard triplet template word pool.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-top-supports-per-shape",
+        type=int,
+        default=24,
+        help="Maximum word supports retained per token-set shape for direct standard triplet templates.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-max-cuts",
+        type=int,
+        default=100000,
+        help="Maximum validated standard triplet template cuts retained per family before global cut selection.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-validate",
+        action="store_true",
+        help="Validate standard triplet template cuts by enumerating projected path signatures; expensive.",
+    )
+    parser.add_argument(
+        "--lp-run-all-cut-families",
+        action="store_true",
+        help="Run every requested cut family even when an earlier hull family found cuts.",
     )
     return parser.parse_args()
 
@@ -466,11 +659,38 @@ def main() -> None:
         short_word_pair_hull_candidate_top_words_multiplier=args.lp_short_word_pair_hull_candidate_top_words_multiplier,
         short_word_pair_hull_candidate_strategy=args.lp_short_word_pair_hull_candidate_strategy,
         short_word_pair_hull_candidate_random_seed=args.lp_short_word_pair_hull_candidate_random_seed,
+        short_word_pair_hull_pruning=args.lp_short_word_pair_hull_pruning,
         short_word_pair_hull_workers=args.lp_short_word_pair_hull_workers,
         short_word_pair_hull_batch_size=args.lp_short_word_pair_hull_batch_size,
         short_word_pair_hull_min_fractional_shared_colors=args.lp_short_word_pair_hull_min_fractional_shared_colors,
         short_word_pair_hull_cache_max_entries=args.lp_short_word_pair_hull_cache_max_entries,
         short_word_pair_hull_cache_value_quantum=args.lp_short_word_pair_hull_cache_value_quantum,
+        short_word_pair_template_max_words=args.lp_short_word_pair_template_max_words,
+        short_word_pair_template_max_length=args.lp_short_word_pair_template_max_length,
+        short_word_pair_template_candidate_word_multiplier=args.lp_short_word_pair_template_candidate_word_multiplier,
+        short_word_pair_template_top_supports_per_shape=args.lp_short_word_pair_template_top_supports_per_shape,
+        short_word_pair_template_max_chain_edges=args.lp_short_word_pair_template_max_chain_edges,
+        short_word_pair_template_max_cuts=args.lp_short_word_pair_template_max_cuts,
+        short_word_triple_hull_max_words=args.lp_short_word_triple_hull_max_words,
+        short_word_triple_hull_max_length=args.lp_short_word_triple_hull_max_length,
+        short_word_triple_hull_max_rows=args.lp_short_word_triple_hull_max_rows,
+        short_word_triple_hull_max_triples=args.lp_short_word_triple_hull_max_triples,
+        short_word_triple_hull_top_words_per_color=args.lp_short_word_triple_hull_top_words_per_color,
+        short_word_triple_hull_candidate_word_multiplier=args.lp_short_word_triple_hull_candidate_word_multiplier,
+        short_word_triple_hull_candidate_top_words_multiplier=args.lp_short_word_triple_hull_candidate_top_words_multiplier,
+        short_word_triple_hull_candidate_sample=args.lp_short_word_triple_hull_candidate_sample,
+        short_word_triple_hull_candidate_random_seed=args.lp_short_word_triple_hull_candidate_random_seed,
+        short_word_triple_hull_token_mode=args.lp_short_word_triple_hull_token_mode,
+        short_word_triple_hull_min_fractional_colors=args.lp_short_word_triple_hull_min_fractional_colors,
+        short_word_triple_hull_workers=args.lp_short_word_triple_hull_workers,
+        short_word_triple_hull_batch_size=args.lp_short_word_triple_hull_batch_size,
+        short_word_triple_template_max_words=args.lp_short_word_triple_template_max_words,
+        short_word_triple_template_max_length=args.lp_short_word_triple_template_max_length,
+        short_word_triple_template_candidate_word_multiplier=args.lp_short_word_triple_template_candidate_word_multiplier,
+        short_word_triple_template_top_supports_per_shape=args.lp_short_word_triple_template_top_supports_per_shape,
+        short_word_triple_template_max_cuts=args.lp_short_word_triple_template_max_cuts,
+        short_word_triple_template_validate=args.lp_short_word_triple_template_validate,
+        run_all_cut_families=args.lp_run_all_cut_families,
     )
 
     if args.kind in {"lp", "both"}:
@@ -490,6 +710,7 @@ def main() -> None:
             cut_config=cut_config,
             lp_solution_cache_dir=args.lp_solution_cache_dir,
             lp_solver=args.lp_solver,
+            resume=not args.no_resume,
         )
 
     if args.kind in {"bpe", "both"}:

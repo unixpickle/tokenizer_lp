@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import json
 import logging
 import time
 import hashlib
+import heapq
 import math
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import combinations
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -55,6 +57,7 @@ class CutSeparationConfig:
     short_word_pair_hull_candidate_top_words_multiplier: float = 1.0
     short_word_pair_hull_candidate_strategy: str = "score"
     short_word_pair_hull_candidate_random_seed: int = 0
+    short_word_pair_hull_pruning: str = "full"
     short_word_pair_hull_workers: int = 0
     short_word_pair_hull_batch_size: int = 32
     short_word_pair_hull_min_fractional_shared_colors: int = 1
@@ -65,6 +68,32 @@ class CutSeparationConfig:
         compare=False,
         repr=False,
     )
+    short_word_pair_template_max_words: int = 700
+    short_word_pair_template_max_length: int = 12
+    short_word_pair_template_candidate_word_multiplier: float = 1.0
+    short_word_pair_template_top_supports_per_shape: int = 24
+    short_word_pair_template_max_chain_edges: int = 6
+    short_word_pair_template_max_cuts: int = 100000
+    short_word_triple_hull_max_words: int = 700
+    short_word_triple_hull_max_length: int = 12
+    short_word_triple_hull_max_rows: int = 200000
+    short_word_triple_hull_max_triples: int = 30000
+    short_word_triple_hull_top_words_per_color: int = 48
+    short_word_triple_hull_candidate_word_multiplier: float = 1.0
+    short_word_triple_hull_candidate_top_words_multiplier: float = 1.0
+    short_word_triple_hull_candidate_sample: int = 250000
+    short_word_triple_hull_candidate_random_seed: int = 0
+    short_word_triple_hull_token_mode: str = "at_least_two"
+    short_word_triple_hull_min_fractional_colors: int = 2
+    short_word_triple_hull_workers: int = 0
+    short_word_triple_hull_batch_size: int = 32
+    short_word_triple_template_max_words: int = 700
+    short_word_triple_template_max_length: int = 12
+    short_word_triple_template_candidate_word_multiplier: float = 1.0
+    short_word_triple_template_top_supports_per_shape: int = 24
+    short_word_triple_template_max_cuts: int = 100000
+    short_word_triple_template_validate: bool = False
+    run_all_cut_families: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +140,7 @@ def train_lp_tokenizer(
     cut_config: CutSeparationConfig | None = None,
     lp_solution_cache_dir: str | Path | None = None,
     lp_solver: str = "highspy",
+    resume: bool = True,
     iteration_callback: Callable[[LpSolveIteration, LpDpTokenizer], None] | None = None,
 ) -> LpTrainingResult:
     special_tokens = list(special_tokens or DEFAULT_SPECIAL_TOKENS)
@@ -155,6 +185,7 @@ def train_lp_tokenizer(
         cut_config=cut_config,
         lp_solution_cache_dir=lp_solution_cache_dir,
         lp_solver=lp_solver,
+        resume_state_dir=(Path(output_dir) / "training_state") if output_dir is not None and resume else None,
         iteration_callback=handle_iteration,
     )
     selected_candidates = round_lp_tokens(candidates, multi_token_budget, excluded=set(base_vocab))
@@ -209,6 +240,7 @@ def solve_lp_vocabulary(
     cut_config: CutSeparationConfig | None = None,
     lp_solution_cache_dir: str | Path | None = None,
     lp_solver: str = "highspy",
+    resume_state_dir: str | Path | None = None,
     iteration_callback: Callable[[LpSolveIteration], None] | None = None,
 ) -> CandidateList:
     if num_allowed_tokens <= 0:
@@ -251,6 +283,48 @@ def solve_lp_vocabulary(
     existing_cut_keys: set[tuple[int, int, int]] = set()
     iterations: list[LpSolveIteration] = []
     final_candidates = CandidateList()
+    resume_checkpoint = None
+    active_cut_matrix = sp.csr_matrix((0, lp["c"].shape[0]), dtype=float)
+    active_cut_rhs = np.array([], dtype=float)
+    next_iteration = 0
+    state_dir = Path(resume_state_dir) if resume_state_dir is not None else None
+    highs_basis_path = state_dir / "highs_basis.bas" if state_dir is not None else None
+    state_key = lp_training_state_key(
+        word_counts=word_counts,
+        num_allowed_tokens=num_allowed_tokens,
+        min_token_count=min_token_count,
+        max_token_length=max_token_length,
+        cut_rounds=cut_rounds,
+        cuts_per_round=cuts_per_round,
+        cut_tolerance=cut_tolerance,
+        cut_families=cut_families,
+        cut_config=cut_config,
+        lp=lp,
+    )
+    if state_dir is not None:
+        resume_checkpoint = load_lp_training_checkpoint(state_dir, state_key, num_vars=lp["c"].shape[0])
+        if resume_checkpoint is not None:
+            if resume_checkpoint["completed"]:
+                LOGGER.info("Loaded completed LP training checkpoint from %s", state_dir)
+                return resume_checkpoint["final_candidates"]
+            existing_cut_keys = set(resume_checkpoint["existing_cut_keys"])
+            iterations = list(resume_checkpoint["iterations"])
+            final_candidates = resume_checkpoint["final_candidates"]
+            cut_config.short_word_pair_hull_solution_cache.update(
+                resume_checkpoint["short_word_pair_hull_solution_cache"]
+            )
+            active_cut_matrix = resume_checkpoint["cut_matrix"]
+            active_cut_rhs = resume_checkpoint["cut_rhs"]
+            next_iteration = int(resume_checkpoint["next_iteration"])
+            if active_cut_matrix.shape[0]:
+                a_ub = sp.vstack([a_ub, active_cut_matrix], format="csr")
+                b_ub = np.concatenate([b_ub, active_cut_rhs])
+            LOGGER.info(
+                "Resuming LP training from %s at iteration %d with %d active cuts",
+                state_dir,
+                next_iteration,
+                len(existing_cut_keys),
+            )
     highs_solver = None
     if lp_solver == "highspy":
         highs_solver = HighsWarmLpSolver(
@@ -262,11 +336,12 @@ def solve_lp_vocabulary(
             lb=lp["lb"],
             ub=lp["ub"],
             cache_dir=lp_solution_cache_dir,
+            basis_path=highs_basis_path,
         )
     elif lp_solver != "scipy":
         raise ValueError(f"Unsupported LP solver {lp_solver!r}. Expected 'highspy' or 'scipy'.")
 
-    for iteration in range(cut_rounds + 1):
+    for iteration in range(next_iteration, cut_rounds + 1):
         start = time.monotonic()
         if highs_solver is not None:
             solution = highs_solver.solve()
@@ -294,11 +369,39 @@ def solve_lp_vocabulary(
         candidates.solve_seconds = solve_seconds
         candidates.status = str(solution.message)
 
+        iteration_result = LpSolveIteration(
+            iteration=iteration,
+            objective_value=float(solution.fun),
+            token_count_lower_bound=float(solution.fun),
+            solve_seconds=solve_seconds,
+            status=str(solution.message),
+            total_cuts=len(existing_cut_keys),
+            added_cuts=-1,
+            max_violation=float("nan"),
+            fractional_colors=fractional_colors,
+            candidates=list(candidates),
+        )
+        iterations.append(iteration_result)
+        LOGGER.info(
+            "LP iteration %d solved in %.3fs: objective=%.3f nonzero_tokens=%d "
+            "fractional_colors=%d active_cuts=%d",
+            iteration,
+            solve_seconds,
+            solution.fun,
+            len(candidates),
+            fractional_colors,
+            len(existing_cut_keys),
+        )
+        if iteration_callback is not None:
+            iteration_callback(iteration_result)
+
+        final_candidates = candidates
         added_cuts = 0
         max_violation = 0.0
         cut_matrix = None
         cut_keys: list[tuple[int, int, int]] = []
         if iteration < cut_rounds:
+            LOGGER.info("LP iteration %d starting cut separation", iteration)
             cut_matrix, cut_rhs, cut_keys, max_violation = separate_cuts(
                 lp,
                 solution.x,
@@ -310,48 +413,381 @@ def solve_lp_vocabulary(
                 separation_round=iteration,
             )
             added_cuts = len(cut_keys)
+            iteration_result = replace(
+                iteration_result,
+                added_cuts=added_cuts,
+                max_violation=max_violation,
+            )
+            iterations[-1] = iteration_result
+            LOGGER.info(
+                "LP iteration %d separation complete: active_cuts=%d next_cuts=%d max_cut_violation=%.6g",
+                iteration,
+                len(existing_cut_keys),
+                added_cuts,
+                max_violation,
+            )
 
-        iteration_result = LpSolveIteration(
-            iteration=iteration,
-            objective_value=float(solution.fun),
-            token_count_lower_bound=float(solution.fun),
-            solve_seconds=solve_seconds,
-            status=str(solution.message),
-            total_cuts=len(existing_cut_keys),
-            added_cuts=added_cuts,
-            max_violation=max_violation,
-            fractional_colors=fractional_colors,
-            candidates=list(candidates),
-        )
-        iterations.append(iteration_result)
-        LOGGER.info(
-            "LP iteration %d solved in %.3fs: objective=%.3f nonzero_tokens=%d "
-            "fractional_colors=%d active_cuts=%d next_cuts=%d max_cut_violation=%.6g",
-            iteration,
-            solve_seconds,
-            solution.fun,
-            len(candidates),
-            fractional_colors,
-            len(existing_cut_keys),
-            added_cuts,
-            max_violation,
-        )
-        if iteration_callback is not None:
-            iteration_callback(iteration_result)
-
-        final_candidates = candidates
         if added_cuts == 0:
+            final_candidates.iterations = iterations
+            if state_dir is not None:
+                if highs_solver is not None:
+                    highs_solver.save_basis(highs_basis_path)
+                save_lp_training_checkpoint(
+                    state_dir,
+                    state_key=state_key,
+                    next_iteration=iteration + 1,
+                    existing_cut_keys=existing_cut_keys,
+                    cut_matrix=active_cut_matrix,
+                    cut_rhs=active_cut_rhs,
+                    iterations=iterations,
+                    final_candidates=final_candidates,
+                    latest_solution=solution.x,
+                    short_word_pair_hull_solution_cache=cut_config.short_word_pair_hull_solution_cache,
+                    completed=True,
+                )
             break
 
         existing_cut_keys.update(cut_keys)
+        active_cut_matrix = sp.vstack([active_cut_matrix, cut_matrix], format="csr")
+        active_cut_rhs = np.concatenate([active_cut_rhs, cut_rhs])
         if highs_solver is not None:
             highs_solver.add_ub_rows(cut_matrix, cut_rhs)
+            if state_dir is not None:
+                highs_solver.save_basis(highs_basis_path)
         else:
             a_ub = sp.vstack([a_ub, cut_matrix], format="csr")
             b_ub = np.concatenate([b_ub, cut_rhs])
+        if state_dir is not None:
+            save_lp_training_checkpoint(
+                state_dir,
+                state_key=state_key,
+                next_iteration=iteration + 1,
+                existing_cut_keys=existing_cut_keys,
+                cut_matrix=active_cut_matrix,
+                cut_rhs=active_cut_rhs,
+                iterations=iterations,
+                final_candidates=final_candidates,
+                latest_solution=solution.x,
+                short_word_pair_hull_solution_cache=cut_config.short_word_pair_hull_solution_cache,
+                completed=False,
+            )
 
     final_candidates.iterations = iterations
     return final_candidates
+
+
+def lp_training_state_key(
+    *,
+    word_counts: Counter[str],
+    num_allowed_tokens: int,
+    min_token_count: int,
+    max_token_length: int | None,
+    cut_rounds: int,
+    cuts_per_round: int,
+    cut_tolerance: float,
+    cut_families: tuple[str, ...],
+    cut_config: CutSeparationConfig,
+    lp,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(b"tokenizer-lp-training-state-v1")
+    hasher.update(str(int(num_allowed_tokens)).encode("ascii"))
+    hasher.update(str(int(min_token_count)).encode("ascii"))
+    hasher.update(str(max_token_length).encode("ascii"))
+    cut_payload = {
+        "cut_rounds": int(cut_rounds),
+        "cuts_per_round": int(cuts_per_round),
+        "cut_tolerance": float(cut_tolerance),
+        "cut_families": list(cut_families),
+        "cut_config": cut_config_state_payload(cut_config),
+    }
+    hasher.update(json.dumps(cut_payload, sort_keys=True).encode("utf-8"))
+    hasher.update(str(int(lp["num_tokens"])).encode("ascii"))
+    hasher.update(str(int(lp["num_nonfree_edges"])).encode("ascii"))
+    hasher.update(str(int(lp["num_free_edges"])).encode("ascii"))
+    for word, count in sorted(word_counts.items()):
+        encoded = word.encode("utf-8")
+        hasher.update(len(encoded).to_bytes(8, "little"))
+        hasher.update(encoded)
+        hasher.update(int(count).to_bytes(8, "little", signed=False))
+    return hasher.hexdigest()
+
+
+def cut_config_state_payload(config: CutSeparationConfig) -> dict:
+    payload = {}
+    for config_field in fields(config):
+        if config_field.name == "short_word_pair_hull_solution_cache":
+            continue
+        payload[config_field.name] = getattr(config, config_field.name)
+    return payload
+
+
+def load_lp_training_checkpoint(state_dir: Path, state_key: str, *, num_vars: int):
+    state_path = state_dir / "state.json"
+    cut_matrix_path = state_dir / "active_cuts.npz"
+    cut_rhs_path = state_dir / "active_cut_rhs.npy"
+    latest_solution_path = state_dir / "latest_solution.npy"
+    if not state_path.exists():
+        return None
+
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Ignoring unreadable LP training checkpoint %s: %s", state_path, exc)
+        return None
+
+    if payload.get("version") != 1:
+        LOGGER.warning("Ignoring unsupported LP training checkpoint version in %s", state_path)
+        return None
+    state_key_matches = payload.get("state_key") == state_key
+
+    try:
+        if cut_matrix_path.exists():
+            cut_matrix = sp.load_npz(cut_matrix_path).tocsr()
+        else:
+            cut_matrix = sp.csr_matrix((0, num_vars), dtype=float)
+        if cut_rhs_path.exists():
+            cut_rhs = np.load(cut_rhs_path, allow_pickle=False)
+        else:
+            cut_rhs = np.array([], dtype=float)
+        if latest_solution_path.exists():
+            latest_solution = np.load(latest_solution_path, allow_pickle=False)
+        else:
+            latest_solution = None
+    except (OSError, ValueError) as exc:
+        LOGGER.warning("Ignoring unreadable LP training cut checkpoint in %s: %s", state_dir, exc)
+        return None
+
+    if cut_matrix.shape[1] != num_vars or cut_matrix.shape[0] != cut_rhs.shape[0]:
+        LOGGER.warning("Ignoring LP training checkpoint with incompatible cut dimensions: %s", state_dir)
+        return None
+    if latest_solution is not None and latest_solution.shape[0] != num_vars:
+        LOGGER.warning("Ignoring LP training checkpoint with incompatible solution dimensions: %s", state_dir)
+        return None
+    if not state_key_matches:
+        LOGGER.warning(
+            "LP training checkpoint corpus/config hash differs, but dimensions match; "
+            "resuming with existing cuts and current separation settings: %s",
+            state_path,
+        )
+
+    final_candidates = candidate_list_from_json(payload.get("final_candidates") or [])
+    final_metadata = payload.get("final_metadata") or {}
+    final_candidates.objective_value = float(final_metadata.get("objective_value", float("nan")))
+    final_candidates.token_count_lower_bound = float(final_metadata.get("token_count_lower_bound", float("nan")))
+    final_candidates.solve_seconds = float(final_metadata.get("solve_seconds", float("nan")))
+    final_candidates.status = str(final_metadata.get("status", "unknown"))
+    final_candidates.iterations = [
+        lp_solve_iteration_from_json(item)
+        for item in payload.get("iterations", [])
+    ]
+
+    return {
+        "completed": bool(payload.get("completed", False)),
+        "next_iteration": int(payload.get("next_iteration", 0)),
+        "existing_cut_keys": [
+            tupleify_json_key(key)
+            for key in payload.get("existing_cut_keys", [])
+        ],
+        "cut_matrix": cut_matrix,
+        "cut_rhs": np.asarray(cut_rhs, dtype=float),
+        "iterations": final_candidates.iterations,
+        "final_candidates": final_candidates,
+        "latest_solution": latest_solution,
+        "short_word_pair_hull_solution_cache": pair_hull_solution_cache_from_json(
+            payload.get("short_word_pair_hull_solution_cache") or {}
+        ),
+    }
+
+
+def save_lp_training_checkpoint(
+    state_dir: Path,
+    *,
+    state_key: str,
+    next_iteration: int,
+    existing_cut_keys: set[tuple],
+    cut_matrix,
+    cut_rhs,
+    iterations: list[LpSolveIteration],
+    final_candidates: CandidateList,
+    latest_solution,
+    short_word_pair_hull_solution_cache: dict[str, dict | None],
+    completed: bool,
+) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    cut_matrix = cut_matrix.tocsr()
+    cut_rhs = np.asarray(cut_rhs, dtype=float)
+    payload = {
+        "version": 1,
+        "state_key": state_key,
+        "completed": bool(completed),
+        "next_iteration": int(next_iteration),
+        "existing_cut_keys": [jsonify_key(key) for key in sorted(existing_cut_keys, key=repr)],
+        "iterations": [lp_solve_iteration_to_json(iteration) for iteration in iterations],
+        "final_candidates": [possible_token_to_json(token) for token in final_candidates],
+        "final_metadata": {
+            "objective_value": float(getattr(final_candidates, "objective_value", float("nan"))),
+            "token_count_lower_bound": float(
+                getattr(final_candidates, "token_count_lower_bound", float("nan"))
+            ),
+            "solve_seconds": float(getattr(final_candidates, "solve_seconds", float("nan"))),
+            "status": str(getattr(final_candidates, "status", "unknown")),
+        },
+        "short_word_pair_hull_solution_cache": pair_hull_solution_cache_to_json(
+            short_word_pair_hull_solution_cache
+        ),
+    }
+
+    atomic_save_sparse_npz(state_dir / "active_cuts.npz", cut_matrix)
+    atomic_save_npy(state_dir / "active_cut_rhs.npy", cut_rhs)
+    atomic_save_npy(state_dir / "latest_solution.npy", np.asarray(latest_solution, dtype=float))
+    atomic_write_text(state_dir / "state.json", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    LOGGER.info(
+        "Saved LP training checkpoint to %s: next_iteration=%d active_cuts=%d completed=%s",
+        state_dir,
+        next_iteration,
+        cut_matrix.shape[0],
+        completed,
+    )
+
+
+def lp_solve_iteration_to_json(iteration: LpSolveIteration) -> dict:
+    return {
+        "iteration": int(iteration.iteration),
+        "objective_value": float(iteration.objective_value),
+        "token_count_lower_bound": float(iteration.token_count_lower_bound),
+        "solve_seconds": float(iteration.solve_seconds),
+        "status": iteration.status,
+        "total_cuts": int(iteration.total_cuts),
+        "added_cuts": int(iteration.added_cuts),
+        "max_violation": float(iteration.max_violation),
+        "fractional_colors": int(iteration.fractional_colors),
+        "candidates": [possible_token_to_json(token) for token in iteration.candidates],
+    }
+
+
+def lp_solve_iteration_from_json(payload: dict) -> LpSolveIteration:
+    return LpSolveIteration(
+        iteration=int(payload["iteration"]),
+        objective_value=float(payload["objective_value"]),
+        token_count_lower_bound=float(payload["token_count_lower_bound"]),
+        solve_seconds=float(payload["solve_seconds"]),
+        status=str(payload["status"]),
+        total_cuts=int(payload["total_cuts"]),
+        added_cuts=int(payload["added_cuts"]),
+        max_violation=float(payload["max_violation"]),
+        fractional_colors=int(payload["fractional_colors"]),
+        candidates=list(candidate_list_from_json(payload.get("candidates", []))),
+    )
+
+
+def possible_token_to_json(token: possibleToken) -> dict:
+    return {
+        "token": token.token,
+        "lp_value": float(token.lp_value),
+        "instance_count": int(token.token_instance_count),
+        "index": int(token.token_index),
+    }
+
+
+def candidate_list_from_json(payload: list[dict]) -> CandidateList:
+    return CandidateList(
+        possibleToken(
+            token=str(item["token"]),
+            lp_value=float(item["lp_value"]),
+            instance_count=int(item["instance_count"]),
+            index=int(item["index"]),
+        )
+        for item in payload
+    )
+
+
+def pair_hull_solution_cache_to_json(cache: dict[str, dict | None]) -> dict:
+    encoded = {}
+    for cache_key, value in cache.items():
+        if value is None:
+            encoded[cache_key] = None
+            continue
+        cut = value.get("cut")
+        encoded[cache_key] = {
+            "cut": cut_to_json(cut) if cut is not None else None,
+            "build_seconds": float(value.get("build_seconds", 0.0)),
+            "solve_seconds": float(value.get("solve_seconds", 0.0)),
+            "cache_key": value.get("cache_key"),
+        }
+    return encoded
+
+
+def pair_hull_solution_cache_from_json(payload: dict) -> dict[str, dict | None]:
+    decoded = {}
+    for cache_key, value in payload.items():
+        if value is None:
+            decoded[str(cache_key)] = None
+            continue
+        decoded[str(cache_key)] = {
+            "cut": cut_from_json(value["cut"]) if value.get("cut") is not None else None,
+            "build_seconds": float(value.get("build_seconds", 0.0)),
+            "solve_seconds": float(value.get("solve_seconds", 0.0)),
+            "cache_key": value.get("cache_key"),
+        }
+    return decoded
+
+
+def cut_to_json(cut) -> list:
+    violation, key, entries, rhs = cut
+    return [
+        float(violation),
+        jsonify_key(key),
+        [[int(col_idx), float(coefficient)] for col_idx, coefficient in entries],
+        float(rhs),
+    ]
+
+
+def cut_from_json(payload: list):
+    return (
+        float(payload[0]),
+        tupleify_json_key(payload[1]),
+        [(int(col_idx), float(coefficient)) for col_idx, coefficient in payload[2]],
+        float(payload[3]),
+    )
+
+
+def jsonify_key(value):
+    if isinstance(value, tuple):
+        return [jsonify_key(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value
+
+
+def tupleify_json_key(value):
+    if isinstance(value, list):
+        return tuple(tupleify_json_key(item) for item in value)
+    return value
+
+
+def atomic_save_sparse_npz(path: Path, matrix) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    with tmp_path.open("wb") as handle:
+        sp.save_npz(handle, matrix, compressed=True)
+    os.replace(tmp_path, path)
+
+
+def atomic_save_npy(path: Path, array: np.ndarray) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    with tmp_path.open("wb") as handle:
+        np.save(handle, array, allow_pickle=False)
+    os.replace(tmp_path, path)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def candidates_from_solution(tokens, lp, x_values) -> CandidateList:
@@ -432,6 +868,7 @@ class HighsWarmLpSolver:
         lb,
         ub,
         cache_dir=None,
+        basis_path: str | Path | None = None,
         highs_threads: int = 0,
         highs_parallel: str = "on",
     ):
@@ -439,6 +876,7 @@ class HighsWarmLpSolver:
 
         self.highspy = highspy
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.basis_path = Path(basis_path) if basis_path is not None else None
         self.c = np.asarray(c, dtype=float)
         self.A_ub = A_ub.tocsr()
         self.b_ub = np.asarray(b_ub, dtype=float)
@@ -461,6 +899,7 @@ class HighsWarmLpSolver:
         self.highs.setOptionValue("presolve", "on")
         self.highs.passModel(self._build_model())
         self.has_basis = False
+        self._load_basis()
 
     def solve(self):
         cached = self._load_cache()
@@ -486,6 +925,23 @@ class HighsWarmLpSolver:
         self.has_basis = True
         self._save_cache(result)
         return result
+
+    def save_basis(self, basis_path: str | Path | None = None) -> None:
+        path = Path(basis_path) if basis_path is not None else self.basis_path
+        if path is None or not self.has_basis:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
+        status = self.highs.writeBasis(str(tmp_path))
+        if status not in (self.highspy.HighsStatus.kOk, self.highspy.HighsStatus.kWarning) or not tmp_path.exists():
+            LOGGER.warning("HiGHS failed to save basis to %s: %s", path, status)
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            return
+        os.replace(tmp_path, path)
+        LOGGER.info("Saved HiGHS basis to %s", path)
 
     def add_ub_rows(self, A_rows, b_rows) -> int | None:
         if A_rows is None:
@@ -566,6 +1022,17 @@ class HighsWarmLpSolver:
         lp.sense_ = highspy.ObjSense.kMinimize
         lp.offset_ = 0.0
         return lp
+
+    def _load_basis(self) -> None:
+        if self.basis_path is None or not self.basis_path.exists():
+            return
+        status = self.highs.readBasis(str(self.basis_path))
+        if status != self.highspy.HighsStatus.kOk:
+            LOGGER.warning("HiGHS failed to load basis from %s: %s", self.basis_path, status)
+            return
+        self.has_basis = True
+        self.highs.setOptionValue("presolve", "off")
+        LOGGER.info("Loaded HiGHS basis from %s", self.basis_path)
 
     def _cache_path(self) -> Path | None:
         if self.cache_dir is None:
@@ -655,7 +1122,7 @@ def separate_cuts(
     f_values = x_values[:num_f]
     t_values = x_values[num_f + num_g :]
 
-    violations = []
+    violations = PerFamilyCutList(max_per_extend=max_cuts)
     family_set = set(families)
     if "boundary" in family_set:
         violations.extend(
@@ -855,7 +1322,7 @@ def separate_cuts(
             max_paths=config.word_support_max_paths,
         )
         violations.extend(short_word_full_hull_violations)
-    if "short_word_pair_hull" in family_set and not short_word_full_hull_violations:
+    if "short_word_pair_hull" in family_set and (config.run_all_cut_families or not short_word_full_hull_violations):
         violations.extend(
             separate_short_word_pair_hull_cut_specs(
                 lp,
@@ -874,6 +1341,7 @@ def separate_cuts(
                 candidate_top_words_multiplier=config.short_word_pair_hull_candidate_top_words_multiplier,
                 candidate_strategy=config.short_word_pair_hull_candidate_strategy,
                 candidate_random_seed=config.short_word_pair_hull_candidate_random_seed + 1_000_003 * separation_round,
+                pruning=config.short_word_pair_hull_pruning,
                 max_paths=config.word_support_max_paths,
                 workers=config.short_word_pair_hull_workers,
                 batch_size=config.short_word_pair_hull_batch_size,
@@ -881,6 +1349,124 @@ def separate_cuts(
                 solution_cache=config.short_word_pair_hull_solution_cache,
                 solution_cache_max_entries=config.short_word_pair_hull_cache_max_entries,
                 solution_cache_value_quantum=config.short_word_pair_hull_cache_value_quantum,
+            )
+        )
+    if "short_word_pair_single_chain" in family_set:
+        violations.extend(
+            separate_short_word_pair_chain_template_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                family_name="short_word_pair_single_chain",
+                template="single",
+                max_words=config.short_word_pair_template_max_words,
+                max_word_length=config.short_word_pair_template_max_length,
+                candidate_word_multiplier=config.short_word_pair_template_candidate_word_multiplier,
+                top_supports_per_shape=config.short_word_pair_template_top_supports_per_shape,
+                max_chain_edges=config.short_word_pair_template_max_chain_edges,
+                max_template_cuts=config.short_word_pair_template_max_cuts,
+                max_paths=config.word_support_max_paths,
+            )
+        )
+    if "short_word_pair_bridge_chain" in family_set:
+        violations.extend(
+            separate_short_word_pair_chain_template_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                family_name="short_word_pair_bridge_chain",
+                template="bridge",
+                max_words=config.short_word_pair_template_max_words,
+                max_word_length=config.short_word_pair_template_max_length,
+                candidate_word_multiplier=config.short_word_pair_template_candidate_word_multiplier,
+                top_supports_per_shape=config.short_word_pair_template_top_supports_per_shape,
+                max_chain_edges=config.short_word_pair_template_max_chain_edges,
+                max_template_cuts=config.short_word_pair_template_max_cuts,
+                max_paths=config.word_support_max_paths,
+            )
+        )
+    if "short_word_pair_chains" in family_set:
+        violations.extend(
+            separate_short_word_pair_chain_template_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                family_name="short_word_pair_chains",
+                template="both",
+                max_words=config.short_word_pair_template_max_words,
+                max_word_length=config.short_word_pair_template_max_length,
+                candidate_word_multiplier=config.short_word_pair_template_candidate_word_multiplier,
+                top_supports_per_shape=config.short_word_pair_template_top_supports_per_shape,
+                max_chain_edges=config.short_word_pair_template_max_chain_edges,
+                max_template_cuts=config.short_word_pair_template_max_cuts,
+                max_paths=config.word_support_max_paths,
+            )
+        )
+    if "short_word_triple_hull" in family_set and (config.run_all_cut_families or not short_word_full_hull_violations):
+        violations.extend(
+            separate_short_word_triple_hull_cut_specs(
+                lp,
+                f_values,
+                x_values[num_f : num_f + num_g],
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                max_words=config.short_word_triple_hull_max_words,
+                max_word_length=config.short_word_triple_hull_max_length,
+                max_rows=config.short_word_triple_hull_max_rows,
+                max_triples=config.short_word_triple_hull_max_triples,
+                top_words_per_color=config.short_word_triple_hull_top_words_per_color,
+                candidate_word_multiplier=config.short_word_triple_hull_candidate_word_multiplier,
+                candidate_top_words_multiplier=config.short_word_triple_hull_candidate_top_words_multiplier,
+                candidate_sample=config.short_word_triple_hull_candidate_sample,
+                candidate_random_seed=config.short_word_triple_hull_candidate_random_seed + 1_000_003 * separation_round,
+                token_mode=config.short_word_triple_hull_token_mode,
+                max_paths=config.word_support_max_paths,
+                workers=config.short_word_triple_hull_workers,
+                batch_size=config.short_word_triple_hull_batch_size,
+                min_fractional_colors=config.short_word_triple_hull_min_fractional_colors,
+            )
+        )
+    if "short_word_triple_triangle" in family_set:
+        violations.extend(
+            separate_short_word_triple_template_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                family_name="short_word_triple_triangle",
+                template="triangle",
+                max_words=config.short_word_triple_template_max_words,
+                max_word_length=config.short_word_triple_template_max_length,
+                candidate_word_multiplier=config.short_word_triple_template_candidate_word_multiplier,
+                top_supports_per_shape=config.short_word_triple_template_top_supports_per_shape,
+                max_template_cuts=config.short_word_triple_template_max_cuts,
+                validate_templates=config.short_word_triple_template_validate,
+            )
+        )
+    if "short_word_triple_4cycle" in family_set:
+        violations.extend(
+            separate_short_word_triple_template_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                family_name="short_word_triple_4cycle",
+                template="4cycle",
+                max_words=config.short_word_triple_template_max_words,
+                max_word_length=config.short_word_triple_template_max_length,
+                candidate_word_multiplier=config.short_word_triple_template_candidate_word_multiplier,
+                top_supports_per_shape=config.short_word_triple_template_top_supports_per_shape,
+                max_template_cuts=config.short_word_triple_template_max_cuts,
+                validate_templates=config.short_word_triple_template_validate,
             )
         )
     if "group_value_deep" in family_set:
@@ -1028,6 +1614,24 @@ def separate_cuts(
         [key for _, key, _, _ in selected],
         float(selected[0][0]),
     )
+
+
+class PerFamilyCutList(list):
+    def __init__(self, *, max_per_extend: int):
+        super().__init__()
+        self.max_per_extend = max(0, int(max_per_extend))
+
+    def extend(self, cuts):
+        rows = list(cuts)
+        if self.max_per_extend > 0 and len(rows) > self.max_per_extend:
+            rows.sort(key=lambda item: item[0], reverse=True)
+            LOGGER.info(
+                "Limiting one cut family from %d candidate cuts to top %d",
+                len(rows),
+                self.max_per_extend,
+            )
+            rows = rows[: self.max_per_extend]
+        super().extend(rows)
 
 
 def separate_word_rank_cut_specs(
@@ -1746,6 +2350,11 @@ def reorder_short_word_pair_candidates(
 ):
     if strategy == "score":
         return pair_rows
+    if strategy == "random":
+        shuffled = list(pair_rows)
+        rng = random.Random(random_seed)
+        rng.shuffle(shuffled)
+        return shuffled
     if strategy != "mixed":
         raise ValueError(f"Unsupported short_word_pair_hull candidate strategy {strategy!r}")
 
@@ -1832,6 +2441,21 @@ def pair_hull_worker(task):
     lp = state["lp"]
     left_paths = state["paths_by_word"][left_word]
     right_paths = state["paths_by_word"][right_word]
+    if state.get("pruning", "full") == "fractional_edges_shared_colors":
+        return reduced_pair_hull_worker_result(
+            lp,
+            state["f_values"],
+            state["g_values"],
+            state["t_values"],
+            left_word,
+            right_word,
+            selected_tokens,
+            left_paths,
+            right_paths,
+            tolerance=state["tolerance"],
+            max_pair_rows=state["max_pair_rows"],
+            cache_key=cache_key,
+        )
     cut = pair_full_upward_hull_cut_from_paths(
         lp,
         state["f_values"],
@@ -1862,12 +2486,148 @@ def pair_hull_worker(task):
         "cut": (violation, full_key, entries, rhs),
         "build_seconds": build_seconds,
         "solve_seconds": solve_seconds,
+        "validation_seconds": 0.0,
         "cache_key": cache_key,
     }
 
 
+def reduced_pair_hull_worker_result(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    left_word,
+    right_word,
+    selected_tokens,
+    left_paths,
+    right_paths,
+    *,
+    tolerance,
+    max_pair_rows,
+    cache_key,
+):
+    cut = pair_reduced_fractional_edge_hull_cut_from_paths(
+        lp,
+        f_values,
+        g_values,
+        t_values,
+        left_word,
+        right_word,
+        selected_tokens,
+        left_paths,
+        right_paths,
+        tolerance=tolerance,
+        max_pair_rows=max_pair_rows,
+    )
+    base = {
+        "cut": None,
+        "build_seconds": 0.0,
+        "solve_seconds": 0.0,
+        "validation_seconds": 0.0,
+        "cache_key": cache_key,
+        "skip_reason": None,
+        "reduced_rows": 0,
+        "edge_vars": 0,
+    }
+    if cut is None:
+        return base
+    if cut.get("skip_reason") is not None:
+        base.update(cut)
+        return base
+    if "edge_coefficients" not in cut:
+        base.update(cut)
+        return base
+
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+    entries = []
+    entries.extend((col_idx, coefficient) for col_idx, coefficient in cut["edge_coefficients"].items())
+    entries.extend(
+        (t_offset + token_idx, coefficient)
+        for token_idx, coefficient in cut["token_coefficients"].items()
+    )
+    full_key = (
+        "short_word_pair_hull",
+        left_word,
+        right_word,
+        selected_tokens,
+        cut["coefficient_key"],
+    )
+    base.update(cut)
+    base["cut"] = (cut["violation"], full_key, entries, cut["rhs"])
+    return base
+
+
 def pair_hull_batch_worker(tasks):
     return [pair_hull_worker(task) for task in tasks]
+
+
+TRIPLE_HULL_WORKER_STATE = {}
+
+
+def init_triple_hull_worker(state):
+    global TRIPLE_HULL_WORKER_STATE
+    TRIPLE_HULL_WORKER_STATE = state
+
+
+def triple_hull_worker(task):
+    left_word, middle_word, right_word, selected_tokens = task
+    state = TRIPLE_HULL_WORKER_STATE
+    lp = state["lp"]
+    cut = triple_reduced_fractional_edge_hull_cut_from_paths(
+        lp,
+        state["f_values"],
+        state["g_values"],
+        state["t_values"],
+        (left_word, middle_word, right_word),
+        selected_tokens,
+        [state["paths_by_word"][word_idx] for word_idx in (left_word, middle_word, right_word)],
+        tolerance=state["tolerance"],
+        max_rows=state["max_rows"],
+    )
+    base = {
+        "cut": None,
+        "build_seconds": 0.0,
+        "solve_seconds": 0.0,
+        "validation_seconds": 0.0,
+        "skip_reason": None,
+        "reduced_rows": 0,
+        "edge_vars": 0,
+    }
+    if cut is None:
+        return base
+    if cut.get("skip_reason") is not None:
+        base.update(cut)
+        return base
+    if "edge_coefficients" not in cut:
+        base.update(cut)
+        return base
+
+    num_f = lp["num_nonfree_edges"]
+    num_g = lp["num_free_edges"]
+    t_offset = num_f + num_g
+    entries = []
+    entries.extend((col_idx, coefficient) for col_idx, coefficient in cut["edge_coefficients"].items())
+    entries.extend(
+        (t_offset + token_idx, coefficient)
+        for token_idx, coefficient in cut["token_coefficients"].items()
+    )
+    full_key = (
+        "short_word_triple_hull",
+        left_word,
+        middle_word,
+        right_word,
+        selected_tokens,
+        cut["coefficient_key"],
+    )
+    base.update(cut)
+    base["cut"] = (cut["violation"], full_key, entries, cut["rhs"])
+    return base
+
+
+def triple_hull_batch_worker(tasks):
+    return [triple_hull_worker(task) for task in tasks]
 
 
 def pair_hull_projection_cache_key(
@@ -1879,6 +2639,7 @@ def pair_hull_projection_cache_key(
     right_word: int,
     selected_tokens,
     *,
+    pruning: str,
     value_quantum: float,
 ):
     """Key a pair-hull separator LP by structure and rounded projected LP values."""
@@ -1893,7 +2654,8 @@ def pair_hull_projection_cache_key(
     token_values = [float(t_values[token_idx]) for token_idx in selected_tokens]
 
     hasher = hashlib.sha256()
-    hasher.update(b"tokenizer-lp-pair-hull-projection-v1")
+    hasher.update(b"tokenizer-lp-pair-hull-projection-v2")
+    hasher.update(str(pruning).encode("utf-8"))
     hasher.update(f"value_quantum={float(value_quantum):.17g}".encode("ascii"))
     hash_array(hasher, np.asarray([left_word, right_word, num_f], dtype=np.int64))
     hash_array(hasher, np.asarray(selected_tokens, dtype=np.int64))
@@ -3058,6 +3820,7 @@ def separate_short_word_pair_hull_cut_specs(
     candidate_top_words_multiplier: float = 1.0,
     candidate_strategy: str = "score",
     candidate_random_seed: int = 0,
+    pruning: str = "full",
     max_paths: int = 100000,
     workers: int = 0,
     batch_size: int = 32,
@@ -3069,6 +3832,8 @@ def separate_short_word_pair_hull_cut_specs(
     """Separate full upward local-hull cuts for pairs of short words."""
 
     start_time = time.monotonic()
+    if pruning not in {"full", "fractional_edges_shared_colors"}:
+        raise ValueError(f"Unsupported short_word_pair_hull pruning mode {pruning!r}")
     candidate_max_words = max(max_words, int(math.ceil(max_words * max(1.0, float(candidate_word_multiplier)))))
     candidate_top_words_per_color = max(
         top_words_per_color,
@@ -3110,12 +3875,17 @@ def separate_short_word_pair_hull_cut_specs(
     cache_full_skips = 0
 
     solution_cache = solution_cache if solution_cache is not None and solution_cache_max_entries > 0 else None
+    existing_pair_prefixes = {
+        key[:3]
+        for key in existing_cut_keys
+        if len(key) >= 3 and key[0] == "short_word_pair_hull"
+    }
 
     for _, left_word, right_word in pair_rows:
         if len(tasks) >= max_pairs:
             break
         full_key_prefix = ("short_word_pair_hull", left_word, right_word)
-        if any(key[:3] == full_key_prefix for key in existing_cut_keys):
+        if full_key_prefix in existing_pair_prefixes:
             continue
         left_colors = colors_by_word.setdefault(left_word, all_word_token_colors(lp, left_word))
         right_colors = colors_by_word.setdefault(right_word, all_word_token_colors(lp, right_word))
@@ -3127,7 +3897,10 @@ def separate_short_word_pair_hull_cut_specs(
         if len(shared_fractional_colors) < min_fractional_shared_colors:
             skipped_shared += 1
             continue
-        selected_tokens = tuple(sorted(set(left_colors) | set(right_colors)))
+        if pruning == "fractional_edges_shared_colors":
+            selected_tokens = tuple(sorted(shared_fractional_colors))
+        else:
+            selected_tokens = tuple(sorted(set(left_colors) | set(right_colors)))
         if len(selected_tokens) < 2 or len(selected_tokens) > max_colors:
             skipped_colors += 1
             continue
@@ -3142,6 +3915,7 @@ def separate_short_word_pair_hull_cut_specs(
                 left_word,
                 right_word,
                 selected_tokens,
+                pruning=pruning,
                 value_quantum=solution_cache_value_quantum,
             )
             if cache_key in solution_cache:
@@ -3185,7 +3959,7 @@ def separate_short_word_pair_hull_cut_specs(
         if left_paths is None or right_paths is None:
             skipped_paths += 1
             continue
-        if len(left_paths) * len(right_paths) > max_pair_rows:
+        if pruning == "full" and len(left_paths) * len(right_paths) > max_pair_rows:
             skipped_rows += 1
             continue
         tasks.append((left_word, right_word, selected_tokens, cache_key))
@@ -3193,7 +3967,7 @@ def separate_short_word_pair_hull_cut_specs(
     if not tasks:
         LOGGER.info(
             "short_word_pair_hull: no tasks after filtering candidates=%d candidate_words=%d "
-            "candidate_top_words=%d candidate_strategy=%s candidate_seed=%d skipped_colors=%d "
+            "candidate_top_words=%d candidate_strategy=%s candidate_seed=%d pruning=%s skipped_colors=%d "
             "skipped_shared=%d skipped_paths=%d skipped_rows=%d cache_hits=%d cached_cuts=%d "
             "cached_no_cuts=%d cache_size=%d cache_full_skips=%d cache_value_quantum=%.6g",
             len(pair_rows),
@@ -3201,6 +3975,7 @@ def separate_short_word_pair_hull_cut_specs(
             candidate_top_words_per_color,
             candidate_strategy,
             candidate_random_seed,
+            pruning,
             skipped_colors,
             skipped_shared,
             skipped_paths,
@@ -3222,10 +3997,16 @@ def separate_short_word_pair_hull_cut_specs(
         "t_values": t_values,
         "paths_by_word": paths_by_word,
         "tolerance": tolerance,
+        "pruning": pruning,
+        "max_pair_rows": max_pair_rows,
     }
     checked = 0
     build_seconds = 0.0
     solve_seconds = 0.0
+    validation_seconds = 0.0
+    worker_reduced_row_skips = 0
+    reduced_rows = []
+    edge_vars = []
     progress_interval = max(1, int(math.ceil(len(tasks) / 40)))
     next_progress = progress_interval
 
@@ -3237,7 +4018,8 @@ def separate_short_word_pair_hull_cut_specs(
             next_progress += progress_interval
         LOGGER.info(
             "short_word_pair_hull progress: checked=%d/%d %.1f%% cuts=%d workers=%d "
-            "wall=%.3fs worker_build=%.3fs worker_solve=%.3fs",
+            "wall=%.3fs worker_build=%.3fs worker_solve=%.3fs worker_validate=%.3fs "
+            "worker_row_skips=%d",
             checked,
             len(tasks),
             100.0 * checked / max(1, len(tasks)),
@@ -3246,6 +4028,8 @@ def separate_short_word_pair_hull_cut_specs(
             time.monotonic() - start_time,
             build_seconds,
             solve_seconds,
+            validation_seconds,
+            worker_reduced_row_skips,
         )
 
     if worker_count == 1:
@@ -3257,6 +4041,13 @@ def separate_short_word_pair_hull_cut_specs(
             checked += 1
             build_seconds += result["build_seconds"]
             solve_seconds += result["solve_seconds"]
+            validation_seconds += result.get("validation_seconds", 0.0)
+            if result.get("skip_reason") == "reduced_rows":
+                worker_reduced_row_skips += 1
+            if "reduced_rows" in result:
+                reduced_rows.append(result["reduced_rows"])
+            if "edge_vars" in result:
+                edge_vars.append(result["edge_vars"])
             maybe_cache_pair_hull_result(
                 solution_cache,
                 result.get("cache_key"),
@@ -3284,6 +4075,13 @@ def separate_short_word_pair_hull_cut_specs(
                     checked += 1
                     build_seconds += result["build_seconds"]
                     solve_seconds += result["solve_seconds"]
+                    validation_seconds += result.get("validation_seconds", 0.0)
+                    if result.get("skip_reason") == "reduced_rows":
+                        worker_reduced_row_skips += 1
+                    if "reduced_rows" in result:
+                        reduced_rows.append(result["reduced_rows"])
+                    if "edge_vars" in result:
+                        edge_vars.append(result["edge_vars"])
                     maybe_cache_pair_hull_result(
                         solution_cache,
                         result.get("cache_key"),
@@ -3298,15 +4096,17 @@ def separate_short_word_pair_hull_cut_specs(
     elapsed = time.monotonic() - start_time
     LOGGER.info(
         "short_word_pair_hull: candidates=%d candidate_words=%d candidate_top_words=%d "
-        "candidate_strategy=%s candidate_seed=%d tasks=%d checked=%d cuts=%d workers=%d "
-        "batches=%d batch_size=%d wall=%.3fs worker_build=%.3fs worker_solve=%.3fs skipped_colors=%d "
-        "skipped_shared=%d skipped_paths=%d skipped_rows=%d cache_hits=%d cached_cuts=%d "
-        "cached_no_cuts=%d cache_size=%d cache_full_skips=%d cache_value_quantum=%.6g patterns=%d",
+        "candidate_strategy=%s candidate_seed=%d pruning=%s tasks=%d checked=%d cuts=%d workers=%d "
+        "batches=%d batch_size=%d wall=%.3fs worker_build=%.3fs worker_solve=%.3fs "
+        "worker_validate=%.3fs skipped_colors=%d skipped_shared=%d skipped_paths=%d skipped_rows=%d "
+        "worker_row_skips=%d cache_hits=%d cached_cuts=%d cached_no_cuts=%d cache_size=%d "
+        "cache_full_skips=%d cache_value_quantum=%.6g patterns=%d reduced_rows=%s edge_vars=%s",
         len(pair_rows),
         candidate_max_words,
         candidate_top_words_per_color,
         candidate_strategy,
         candidate_random_seed,
+        pruning,
         len(tasks),
         checked,
         len(violations),
@@ -3316,10 +4116,12 @@ def separate_short_word_pair_hull_cut_specs(
         elapsed,
         build_seconds,
         solve_seconds,
+        validation_seconds,
         skipped_colors,
         skipped_shared,
         skipped_paths,
         skipped_rows,
+        worker_reduced_row_skips,
         cache_hits,
         cache_cut_hits,
         cache_no_cut_hits,
@@ -3327,8 +4129,1072 @@ def separate_short_word_pair_hull_cut_specs(
         cache_full_skips,
         solution_cache_value_quantum,
         len(path_pattern_cache),
+        small_quantile_summary(reduced_rows),
+        small_quantile_summary(edge_vars),
     )
     return violations
+
+
+def separate_short_word_triple_hull_cut_specs(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    max_words: int = 700,
+    max_word_length: int = 12,
+    max_rows: int = 200000,
+    max_triples: int = 30000,
+    top_words_per_color: int = 48,
+    candidate_word_multiplier: float = 1.0,
+    candidate_top_words_multiplier: float = 1.0,
+    candidate_sample: int = 250000,
+    candidate_random_seed: int = 0,
+    token_mode: str = "at_least_two",
+    max_paths: int = 100000,
+    workers: int = 0,
+    batch_size: int = 32,
+    min_fractional_colors: int = 2,
+):
+    """Separate reduced local-hull cuts for triples of short words."""
+
+    start_time = time.monotonic()
+    if token_mode not in {"shared_all", "at_least_two"}:
+        raise ValueError(f"Unsupported short_word_triple_hull token mode {token_mode!r}")
+    rng = random.Random(candidate_random_seed)
+    candidate_max_words = max(max_words, int(math.ceil(max_words * max(1.0, float(candidate_word_multiplier)))))
+    candidate_top_words_per_color = max(
+        top_words_per_color,
+        int(math.ceil(top_words_per_color * max(1.0, float(candidate_top_words_multiplier)))),
+    )
+    fractional_colors = set(np.flatnonzero((t_values > tolerance) & (t_values < 1.0 - tolerance)))
+    ranked_words = rank_short_fractional_words(
+        lp,
+        f_values,
+        t_values,
+        max_words=candidate_max_words,
+        max_word_length=max_word_length,
+        tolerance=tolerance,
+    )
+    word_colors = {}
+    color_to_words = defaultdict(list)
+    for word_idx in ranked_words:
+        scores = defaultdict(float)
+        word_weight = float(lp["word_weights"][word_idx])
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            edge_value = float(f_values[edge_idx])
+            if not (tolerance < edge_value < 1.0 - tolerance):
+                continue
+            info = lp["nonfree_edge_info"][edge_idx]
+            token_idx = info["token_index"]
+            if token_idx not in fractional_colors:
+                continue
+            scores[token_idx] += min(edge_value, 1.0 - edge_value) * max(1, info["end"] - info["start"])
+        word_colors[word_idx] = set(all_word_token_colors(lp, word_idx))
+        for token_idx, score in scores.items():
+            color_to_words[token_idx].append((word_weight * score, word_idx))
+    for rows in color_to_words.values():
+        rows.sort(reverse=True)
+
+    triple_candidates = set()
+    estimated_candidate_triples = 0
+    colors = list(color_to_words)
+    rng.shuffle(colors)
+    per_color_budget = max(1, int(math.ceil(max(1, candidate_sample) / max(1, len(colors)))))
+    for token_idx in colors:
+        words = [word_idx for _, word_idx in color_to_words[token_idx][:candidate_top_words_per_color]]
+        if len(words) < 3:
+            continue
+        estimated_candidate_triples += math.comb(len(words), 3)
+        if len(triple_candidates) >= candidate_sample:
+            continue
+        for _ in range(per_color_budget):
+            triple_candidates.add(tuple(sorted(rng.sample(words, 3))))
+            if len(triple_candidates) >= candidate_sample:
+                break
+
+    candidates = list(triple_candidates)
+    rng.shuffle(candidates)
+    existing_triple_prefixes = {
+        key[:4]
+        for key in existing_cut_keys
+        if len(key) >= 4 and key[0] == "short_word_triple_hull"
+    }
+    path_pattern_cache = {}
+    paths_by_word = {}
+    tasks = []
+    skipped = Counter()
+    for words3 in candidates:
+        if len(tasks) >= max_triples:
+            break
+        full_key_prefix = ("short_word_triple_hull", *words3)
+        if full_key_prefix in existing_triple_prefixes:
+            skipped["existing_cut"] += 1
+            continue
+        color_sets = [word_colors.setdefault(word_idx, set(all_word_token_colors(lp, word_idx))) for word_idx in words3]
+        if token_mode == "shared_all":
+            selected_set = set.intersection(*color_sets) & fractional_colors
+        else:
+            counts = Counter(token_idx for colors_for_word in color_sets for token_idx in colors_for_word if token_idx in fractional_colors)
+            selected_set = {token_idx for token_idx, count in counts.items() if count >= 2}
+        selected_tokens = tuple(sorted(selected_set))
+        if len(selected_tokens) < min_fractional_colors:
+            skipped["shared"] += 1
+            continue
+        ok = True
+        for word_idx in words3:
+            if word_idx not in paths_by_word:
+                paths_by_word[word_idx] = enumerate_word_edge_paths_by_pattern(
+                    lp,
+                    word_idx,
+                    max_paths=max_paths,
+                    cache=path_pattern_cache,
+                )
+            if paths_by_word[word_idx] is None:
+                ok = False
+                break
+        if not ok:
+            skipped["paths"] += 1
+            continue
+        tasks.append((*words3, selected_tokens))
+
+    if not tasks:
+        LOGGER.info(
+            "short_word_triple_hull: no tasks after filtering candidates_sampled=%d "
+            "estimated_candidates=%d candidate_words=%d candidate_top_words=%d candidate_seed=%d "
+            "token_mode=%s skipped=%s patterns=%d",
+            len(candidates),
+            estimated_candidate_triples,
+            candidate_max_words,
+            candidate_top_words_per_color,
+            candidate_random_seed,
+            token_mode,
+            dict(skipped),
+            len(path_pattern_cache),
+        )
+        return []
+
+    worker_count = resolve_pair_hull_workers(workers)
+    worker_state = {
+        "lp": lp,
+        "f_values": f_values,
+        "g_values": g_values,
+        "t_values": t_values,
+        "paths_by_word": paths_by_word,
+        "tolerance": tolerance,
+        "max_rows": max_rows,
+    }
+    violations = []
+    checked = 0
+    build_seconds = 0.0
+    solve_seconds = 0.0
+    validation_seconds = 0.0
+    worker_reduced_row_skips = 0
+    reduced_rows = []
+    edge_vars = []
+    progress_interval = max(1, int(math.ceil(len(tasks) / 40)))
+    next_progress = progress_interval
+
+    def handle_result(result):
+        nonlocal checked, build_seconds, solve_seconds, validation_seconds, worker_reduced_row_skips
+        if result is None:
+            return
+        checked += 1
+        build_seconds += result["build_seconds"]
+        solve_seconds += result["solve_seconds"]
+        validation_seconds += result.get("validation_seconds", 0.0)
+        if result.get("skip_reason") == "reduced_rows":
+            worker_reduced_row_skips += 1
+        if "reduced_rows" in result:
+            reduced_rows.append(result["reduced_rows"])
+        if "edge_vars" in result:
+            edge_vars.append(result["edge_vars"])
+        cut = result["cut"]
+        if cut is not None:
+            violations.append(cut)
+
+    def log_triple_hull_progress():
+        nonlocal next_progress
+        if checked < next_progress or checked >= len(tasks):
+            return
+        while next_progress <= checked:
+            next_progress += progress_interval
+        LOGGER.info(
+            "short_word_triple_hull progress: checked=%d/%d %.1f%% cuts=%d workers=%d "
+            "wall=%.3fs worker_build=%.3fs worker_solve=%.3fs worker_validate=%.3fs "
+            "worker_row_skips=%d",
+            checked,
+            len(tasks),
+            100.0 * checked / max(1, len(tasks)),
+            len(violations),
+            worker_count,
+            time.monotonic() - start_time,
+            build_seconds,
+            solve_seconds,
+            validation_seconds,
+            worker_reduced_row_skips,
+        )
+
+    if worker_count == 1:
+        init_triple_hull_worker(worker_state)
+        for task in tasks:
+            handle_result(triple_hull_worker(task))
+            log_triple_hull_progress()
+    else:
+        context = mp.get_context("fork") if hasattr(os, "fork") else None
+        task_batches = list(chunked(tasks, batch_size))
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=context,
+            initializer=init_triple_hull_worker,
+            initargs=(worker_state,),
+        ) as executor:
+            futures = [executor.submit(triple_hull_batch_worker, batch) for batch in task_batches]
+            for future in as_completed(futures):
+                for result in future.result():
+                    handle_result(result)
+                log_triple_hull_progress()
+
+    elapsed = time.monotonic() - start_time
+    LOGGER.info(
+        "short_word_triple_hull: candidates_sampled=%d estimated_candidates=%d candidate_words=%d "
+        "candidate_top_words=%d candidate_seed=%d token_mode=%s tasks=%d checked=%d cuts=%d "
+        "workers=%d batches=%d batch_size=%d wall=%.3fs worker_build=%.3fs worker_solve=%.3fs "
+        "worker_validate=%.3fs skipped=%s worker_row_skips=%d patterns=%d reduced_rows=%s edge_vars=%s",
+        len(candidates),
+        estimated_candidate_triples,
+        candidate_max_words,
+        candidate_top_words_per_color,
+        candidate_random_seed,
+        token_mode,
+        len(tasks),
+        checked,
+        len(violations),
+        worker_count,
+        len(list(chunked(tasks, batch_size))) if worker_count > 1 else len(tasks),
+        max(1, int(batch_size)),
+        elapsed,
+        build_seconds,
+        solve_seconds,
+        validation_seconds,
+        dict(skipped),
+        worker_reduced_row_skips,
+        len(path_pattern_cache),
+        small_quantile_summary(reduced_rows),
+        small_quantile_summary(edge_vars),
+    )
+    return violations
+
+
+def separate_short_word_pair_chain_template_cut_specs(
+    lp,
+    f_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    family_name: str,
+    template: str,
+    max_words: int = 700,
+    max_word_length: int = 12,
+    candidate_word_multiplier: float = 1.0,
+    top_supports_per_shape: int = 24,
+    max_chain_edges: int = 6,
+    max_template_cuts: int = 100000,
+    max_paths: int = 100000,
+):
+    """Separate validated pair-chain templates found by brute-force pair LPs."""
+
+    start_time = time.monotonic()
+    if template not in {"single", "bridge", "both"}:
+        raise ValueError(f"Unsupported short_word_pair_chain template {template!r}")
+    candidate_max_words = max(max_words, int(math.ceil(max_words * max(1.0, float(candidate_word_multiplier)))))
+    ranked_words = rank_short_fractional_words(
+        lp,
+        f_values,
+        t_values,
+        max_words=candidate_max_words,
+        max_word_length=max_word_length,
+        tolerance=tolerance,
+    )
+    single_supports, bridge_supports, skipped = collect_short_word_pair_chain_supports(
+        lp,
+        f_values,
+        t_values,
+        ranked_words,
+        tolerance=tolerance,
+        top_supports_per_shape=top_supports_per_shape,
+        max_chain_edges=max_chain_edges,
+    )
+    violations = []
+    candidates = 0
+    path_skips = 0
+    if template in {"single", "both"}:
+        single_violations, single_candidates, single_path_skips = separate_single_chain_template_cuts(
+            lp,
+            f_values,
+            t_values,
+            single_supports,
+            existing_cut_keys=existing_cut_keys,
+            family_name=family_name,
+            tolerance=tolerance,
+            max_template_cuts=max_template_cuts,
+            max_paths=max_paths,
+        )
+        violations.extend(single_violations)
+        candidates += single_candidates
+        path_skips += single_path_skips
+    if template in {"bridge", "both"}:
+        bridge_violations, bridge_candidates, bridge_path_skips = separate_bridge_chain_template_cuts(
+            lp,
+            f_values,
+            t_values,
+            bridge_supports,
+            existing_cut_keys=existing_cut_keys,
+            family_name=family_name,
+            tolerance=tolerance,
+            max_template_cuts=max_template_cuts,
+            max_paths=max_paths,
+        )
+        violations.extend(bridge_violations)
+        candidates += bridge_candidates
+        path_skips += bridge_path_skips
+    if max_template_cuts > 0 and len(violations) > max_template_cuts:
+        violations.sort(key=lambda item: item[0], reverse=True)
+        violations = violations[:max_template_cuts]
+    LOGGER.info(
+        "%s: template=%s candidate_words=%d single_supports=%d bridge_shapes=%d "
+        "candidates=%d cuts=%d path_skips=%d skipped=%s top_supports_per_shape=%d "
+        "max_chain_edges=%d max_template_cuts=%d wall=%.3fs",
+        family_name,
+        template,
+        candidate_max_words,
+        len(single_supports),
+        len(bridge_supports),
+        candidates,
+        len(violations),
+        path_skips,
+        dict(skipped),
+        top_supports_per_shape,
+        max_chain_edges,
+        max_template_cuts,
+        time.monotonic() - start_time,
+    )
+    return violations
+
+
+def collect_short_word_pair_chain_supports(
+    lp,
+    f_values,
+    t_values,
+    word_indices,
+    *,
+    tolerance: float,
+    top_supports_per_shape: int,
+    max_chain_edges: int,
+):
+    single_supports = []
+    bridge_by_shape_word = {}
+    skipped = Counter()
+    for word_idx in word_indices:
+        edges_by_start = defaultdict(list)
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            edge_value = float(f_values[edge_idx])
+            if not (tolerance < edge_value < 1.0 - tolerance):
+                continue
+            info = lp["nonfree_edge_info"][edge_idx]
+            token_idx = int(info["token_index"])
+            token_value = float(t_values[token_idx])
+            if not (tolerance < token_value < 1.0 - tolerance):
+                continue
+            edges_by_start[int(info["start"])].append(
+                {
+                    "col": int(edge_idx),
+                    "token": token_idx,
+                    "start": int(info["start"]),
+                    "end": int(info["end"]),
+                    "value": edge_value,
+                }
+            )
+        if not edges_by_start:
+            skipped["no_edges"] += 1
+            continue
+        for start in list(edges_by_start):
+            edges_by_start[start].sort(key=lambda edge: edge["value"], reverse=True)
+            del edges_by_start[start][4:]
+
+        for start in sorted(edges_by_start):
+            for edge in edges_by_start[start]:
+                visit_pair_chain_supports(
+                    word_idx,
+                    (edge,),
+                    edges_by_start,
+                    single_supports,
+                    bridge_by_shape_word,
+                    max_chain_edges=max_chain_edges,
+                )
+
+    bridge_supports = finalize_template_supports(bridge_by_shape_word, top_supports_per_shape)
+    single_supports.sort(key=lambda row: row["value"], reverse=True)
+    return single_supports[: max(1, int(top_supports_per_shape)) * max(1, len(word_indices))], bridge_supports, skipped
+
+
+def visit_pair_chain_supports(
+    word_idx,
+    chain,
+    edges_by_start,
+    single_supports,
+    bridge_by_shape_word,
+    *,
+    max_chain_edges,
+):
+    if len(chain) >= 2:
+        first_token = int(chain[0]["token"])
+        last_token = int(chain[-1]["token"])
+        columns = tuple(int(edge["col"]) for edge in chain)
+        support = {
+            "word": int(word_idx),
+            "columns": columns,
+            "tokens": tuple(sorted({first_token, last_token})),
+            "value": float(sum(float(edge["value"]) for edge in chain)),
+            "shape": tuple(
+                (
+                    int(edge["start"] - chain[0]["start"]),
+                    int(edge["end"] - chain[0]["start"]),
+                )
+                for edge in chain
+            ),
+        }
+        if first_token == last_token and len(chain) >= 4:
+            single_supports.append(support)
+        elif first_token != last_token:
+            keep_best_support_for_word(bridge_by_shape_word, tuple(sorted((first_token, last_token))), word_idx, support)
+    if len(chain) >= max_chain_edges:
+        return
+    next_start = int(chain[-1]["start"]) + 1
+    for edge in edges_by_start.get(next_start, ()):
+        if intervals_overlap(chain[-1], edge):
+            visit_pair_chain_supports(
+                word_idx,
+                (*chain, edge),
+                edges_by_start,
+                single_supports,
+                bridge_by_shape_word,
+                max_chain_edges=max_chain_edges,
+            )
+
+
+def separate_single_chain_template_cuts(
+    lp,
+    f_values,
+    t_values,
+    single_supports,
+    *,
+    existing_cut_keys,
+    family_name,
+    tolerance,
+    max_template_cuts,
+    max_paths,
+):
+    t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
+    heap = []
+    sequence = 0
+    candidates = 0
+    path_skips = 0
+    emitted = set()
+    path_pattern_cache = {}
+    paths_by_word = {}
+    for support in single_supports:
+        candidates += 1
+        word_idx = int(support["word"])
+        selected_tokens = tuple(int(token_idx) for token_idx in support["tokens"])
+        columns = tuple(int(col_idx) for col_idx in support["columns"])
+        if len(selected_tokens) != 1:
+            continue
+        coefficient_key = (word_idx, selected_tokens, columns)
+        if coefficient_key in emitted:
+            continue
+        full_key = (family_name, "single", word_idx, selected_tokens, columns)
+        if full_key in existing_cut_keys:
+            continue
+        edge_coefficients = {col_idx: 1.0 for col_idx in columns}
+        token_coefficients = {selected_tokens[0]: -1.0}
+        rhs = template_cut_max_lhs(
+            lp,
+            (word_idx,),
+            selected_tokens,
+            edge_coefficients,
+            token_coefficients,
+            max_paths=max_paths,
+            path_pattern_cache=path_pattern_cache,
+            paths_by_word=paths_by_word,
+        )
+        if rhs is None:
+            path_skips += 1
+            continue
+        violation = float(sum(float(f_values[col_idx]) for col_idx in columns) - float(t_values[selected_tokens[0]]) - rhs)
+        if violation <= tolerance:
+            continue
+        emitted.add(coefficient_key)
+        entries = [(col_idx, 1.0) for col_idx in columns]
+        entries.append((t_offset + selected_tokens[0], -1.0))
+        cut = (float(violation), full_key, entries, float(rhs))
+        if max_template_cuts > 0:
+            if len(heap) < max_template_cuts:
+                heapq.heappush(heap, (float(violation), sequence, cut))
+                sequence += 1
+            elif violation > heap[0][0]:
+                heapq.heapreplace(heap, (float(violation), sequence, cut))
+                sequence += 1
+        else:
+            heap.append((float(violation), sequence, cut))
+            sequence += 1
+    violations = [row[2] for row in sorted(heap, key=lambda item: item[0], reverse=True)]
+    return violations, candidates, path_skips
+
+
+def separate_bridge_chain_template_cuts(
+    lp,
+    f_values,
+    t_values,
+    bridge_supports,
+    *,
+    existing_cut_keys,
+    family_name,
+    tolerance,
+    max_template_cuts,
+    max_paths,
+):
+    t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
+    heap = []
+    sequence = 0
+    candidates = 0
+    path_skips = 0
+    emitted = set()
+    path_pattern_cache = {}
+    paths_by_word = {}
+    for selected_tokens, supports in bridge_supports.items():
+        if len(selected_tokens) != 2:
+            continue
+        token_sum = sum(float(t_values[token_idx]) for token_idx in selected_tokens)
+        for left_idx, left_support in enumerate(supports):
+            for right_support in supports[left_idx + 1 :]:
+                left_word = int(left_support["word"])
+                right_word = int(right_support["word"])
+                if left_word == right_word:
+                    continue
+                candidates += 1
+                words = (left_word, right_word)
+                columns = tuple(int(col_idx) for col_idx in (*left_support["columns"], *right_support["columns"]))
+                coefficient_key = (tuple(sorted(words)), tuple(int(token_idx) for token_idx in selected_tokens), tuple(sorted(columns)))
+                if coefficient_key in emitted:
+                    continue
+                full_key = (family_name, "bridge", tuple(sorted(words)), tuple(int(token_idx) for token_idx in selected_tokens), tuple(sorted(columns)))
+                if full_key in existing_cut_keys:
+                    continue
+                edge_coefficients = {col_idx: 1.0 for col_idx in columns}
+                token_coefficients = {int(token_idx): -1.0 for token_idx in selected_tokens}
+                rhs = template_cut_max_lhs(
+                    lp,
+                    words,
+                    selected_tokens,
+                    edge_coefficients,
+                    token_coefficients,
+                    max_paths=max_paths,
+                    path_pattern_cache=path_pattern_cache,
+                    paths_by_word=paths_by_word,
+                )
+                if rhs is None:
+                    path_skips += 1
+                    continue
+                violation = float(sum(float(f_values[col_idx]) for col_idx in columns) - token_sum - rhs)
+                if violation <= tolerance:
+                    continue
+                emitted.add(coefficient_key)
+                entries = [(col_idx, 1.0) for col_idx in columns]
+                entries.extend((t_offset + token_idx, -1.0) for token_idx in selected_tokens)
+                cut = (float(violation), full_key, entries, float(rhs))
+                if max_template_cuts > 0:
+                    if len(heap) < max_template_cuts:
+                        heapq.heappush(heap, (float(violation), sequence, cut))
+                        sequence += 1
+                    elif violation > heap[0][0]:
+                        heapq.heapreplace(heap, (float(violation), sequence, cut))
+                        sequence += 1
+                else:
+                    heap.append((float(violation), sequence, cut))
+                    sequence += 1
+    violations = [row[2] for row in sorted(heap, key=lambda item: item[0], reverse=True)]
+    return violations, candidates, path_skips
+
+
+def separate_short_word_triple_template_cut_specs(
+    lp,
+    f_values,
+    t_values,
+    *,
+    existing_cut_keys: set[tuple],
+    tolerance: float,
+    family_name: str,
+    template: str,
+    max_words: int = 700,
+    max_word_length: int = 12,
+    candidate_word_multiplier: float = 1.0,
+    top_supports_per_shape: int = 24,
+    max_template_cuts: int = 100000,
+    validate_templates: bool = False,
+):
+    """Separate fixed small hypergraph templates found by the triplet LP separator."""
+
+    start_time = time.monotonic()
+    if template not in {"triangle", "4cycle"}:
+        raise ValueError(f"Unsupported short_word_triple template {template!r}")
+    candidate_max_words = max(max_words, int(math.ceil(max_words * max(1.0, float(candidate_word_multiplier)))))
+    ranked_words = rank_short_fractional_words(
+        lp,
+        f_values,
+        t_values,
+        max_words=candidate_max_words,
+        max_word_length=max_word_length,
+        tolerance=tolerance,
+    )
+    pair_supports, triple_supports, skipped = collect_short_word_template_supports(
+        lp,
+        f_values,
+        t_values,
+        ranked_words,
+        tolerance=tolerance,
+        top_supports_per_shape=top_supports_per_shape,
+        need_triples=template == "4cycle",
+    )
+    if template == "triangle":
+        violations, candidates, invalid = separate_triangle_template_cuts(
+            lp,
+            f_values,
+            t_values,
+            pair_supports,
+            max_paths=100000,
+            existing_cut_keys=existing_cut_keys,
+            family_name=family_name,
+            tolerance=tolerance,
+            max_template_cuts=max_template_cuts,
+            validate_templates=validate_templates,
+        )
+    else:
+        violations, candidates, invalid = separate_4cycle_template_cuts(
+            lp,
+            f_values,
+            t_values,
+            pair_supports,
+            triple_supports,
+            max_paths=100000,
+            existing_cut_keys=existing_cut_keys,
+            family_name=family_name,
+            tolerance=tolerance,
+            max_template_cuts=max_template_cuts,
+            validate_templates=validate_templates,
+        )
+    LOGGER.info(
+        "%s: template=%s candidate_words=%d pair_shapes=%d triple_shapes=%d candidates=%d "
+        "cuts=%d invalid=%d skipped=%s top_supports_per_shape=%d max_template_cuts=%d "
+        "validate=%s wall=%.3fs",
+        family_name,
+        template,
+        candidate_max_words,
+        len(pair_supports),
+        len(triple_supports),
+        candidates,
+        len(violations),
+        invalid,
+        dict(skipped),
+        top_supports_per_shape,
+        max_template_cuts,
+        validate_templates,
+        time.monotonic() - start_time,
+    )
+    return violations
+
+
+def collect_short_word_template_supports(
+    lp,
+    f_values,
+    t_values,
+    word_indices,
+    *,
+    tolerance: float,
+    top_supports_per_shape: int,
+    need_triples: bool,
+):
+    pair_by_shape_word = {}
+    triple_by_shape_word = {}
+    skipped = Counter()
+    for word_idx in word_indices:
+        edges = []
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            edge_value = float(f_values[edge_idx])
+            if not (tolerance < edge_value < 1.0 - tolerance):
+                continue
+            info = lp["nonfree_edge_info"][edge_idx]
+            token_idx = int(info["token_index"])
+            token_value = float(t_values[token_idx])
+            if not (tolerance < token_value < 1.0 - tolerance):
+                continue
+            edges.append(
+                {
+                    "col": int(edge_idx),
+                    "token": token_idx,
+                    "start": int(info["start"]),
+                    "end": int(info["end"]),
+                    "value": edge_value,
+                }
+            )
+        if len(edges) < 2:
+            skipped["few_edges"] += 1
+            continue
+        for left_idx, left in enumerate(edges):
+            for right in edges[left_idx + 1 :]:
+                if left["token"] == right["token"] or not intervals_overlap(left, right):
+                    continue
+                token_shape = tuple(sorted((left["token"], right["token"])))
+                support = template_support(word_idx, (left, right))
+                keep_best_support_for_word(pair_by_shape_word, token_shape, word_idx, support)
+        if not need_triples or len(edges) < 3:
+            continue
+        for first_idx, first in enumerate(edges):
+            for second_idx in range(first_idx + 1, len(edges)):
+                second = edges[second_idx]
+                if first["token"] == second["token"] or not intervals_overlap(first, second):
+                    continue
+                for third in edges[second_idx + 1 :]:
+                    if len({first["token"], second["token"], third["token"]}) < 3:
+                        continue
+                    if not (
+                        intervals_overlap(first, third)
+                        and intervals_overlap(second, third)
+                    ):
+                        continue
+                    token_shape = tuple(sorted((first["token"], second["token"], third["token"])))
+                    support = template_support(word_idx, (first, second, third))
+                    keep_best_support_for_word(triple_by_shape_word, token_shape, word_idx, support)
+
+    pair_supports = finalize_template_supports(pair_by_shape_word, top_supports_per_shape)
+    triple_supports = finalize_template_supports(triple_by_shape_word, top_supports_per_shape)
+    return pair_supports, triple_supports, skipped
+
+
+def intervals_overlap(left, right) -> bool:
+    return max(left["start"], right["start"]) < min(left["end"], right["end"])
+
+
+def template_support(word_idx: int, edges):
+    columns = tuple(sorted(int(edge["col"]) for edge in edges))
+    return {
+        "word": int(word_idx),
+        "columns": columns,
+        "value": float(sum(float(edge["value"]) for edge in edges)),
+    }
+
+
+def keep_best_support_for_word(by_shape_word, token_shape, word_idx, support):
+    key = (token_shape, int(word_idx))
+    previous = by_shape_word.get(key)
+    if previous is None or support["value"] > previous["value"]:
+        by_shape_word[key] = support
+
+
+def finalize_template_supports(by_shape_word, top_supports_per_shape: int):
+    by_shape = defaultdict(list)
+    for token_shape, _word_idx in by_shape_word:
+        by_shape[token_shape].append(by_shape_word[(token_shape, _word_idx)])
+    limit = max(1, int(top_supports_per_shape))
+    return {
+        token_shape: sorted(supports, key=lambda row: row["value"], reverse=True)[:limit]
+        for token_shape, supports in by_shape.items()
+    }
+
+
+def separate_triangle_template_cuts(
+    lp,
+    f_values,
+    t_values,
+    pair_supports,
+    *,
+    max_paths,
+    existing_cut_keys,
+    family_name,
+    tolerance,
+    max_template_cuts,
+    validate_templates,
+):
+    t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
+    neighbors = defaultdict(set)
+    for left, right in pair_supports:
+        neighbors[left].add(right)
+        neighbors[right].add(left)
+    heap = []
+    sequence = 0
+    candidates = 0
+    invalid = 0
+    emitted = set()
+    path_pattern_cache = {}
+    paths_by_word = {}
+    for first in sorted(neighbors):
+        later = sorted(token_idx for token_idx in neighbors[first] if token_idx > first)
+        for second_idx, second in enumerate(later):
+            for third in later[second_idx + 1 :]:
+                if (second, third) not in pair_supports:
+                    continue
+                token_shape = (first, second, third)
+                token_sum = sum(float(t_values[token_idx]) for token_idx in token_shape)
+                for first_support in pair_supports[(first, second)]:
+                    for second_support in pair_supports[(first, third)]:
+                        if second_support["word"] == first_support["word"]:
+                            continue
+                        for third_support in pair_supports[(second, third)]:
+                            words = (first_support["word"], second_support["word"], third_support["word"])
+                            if len(set(words)) < 3:
+                                continue
+                            candidates += 1
+                            columns = first_support["columns"] + second_support["columns"] + third_support["columns"]
+                            edge_sum = float(f_values[list(columns)].sum())
+                            violation = edge_sum - token_sum - 1.0
+                            if violation <= tolerance:
+                                continue
+                            if max_template_cuts > 0 and len(heap) >= max_template_cuts and violation <= heap[0][0]:
+                                continue
+                            coefficient_key = (token_shape, tuple(sorted(columns)))
+                            if coefficient_key in emitted:
+                                continue
+                            full_key = (family_name, token_shape, tuple(sorted(words)), coefficient_key)
+                            if full_key in existing_cut_keys:
+                                continue
+                            if validate_templates:
+                                max_slack = validate_template_cut(
+                                    lp,
+                                    words,
+                                    token_shape,
+                                    columns,
+                                    max_paths=max_paths,
+                                    path_pattern_cache=path_pattern_cache,
+                                    paths_by_word=paths_by_word,
+                                )
+                                if max_slack is None or max_slack > 1e-7:
+                                    invalid += 1
+                                    continue
+                            emitted.add(coefficient_key)
+                            entries = [(col_idx, 1.0) for col_idx in columns]
+                            entries.extend((t_offset + token_idx, -1.0) for token_idx in token_shape)
+                            cut = (float(violation), full_key, entries, 1.0)
+                            if max_template_cuts > 0:
+                                if len(heap) < max_template_cuts:
+                                    heapq.heappush(heap, (float(violation), sequence, cut))
+                                    sequence += 1
+                                else:
+                                    heapq.heapreplace(heap, (float(violation), sequence, cut))
+                                    sequence += 1
+                            else:
+                                heap.append((float(violation), sequence, cut))
+                                sequence += 1
+    violations = [row[2] for row in sorted(heap, key=lambda item: item[0], reverse=True)]
+    return violations, candidates, invalid
+
+
+def separate_4cycle_template_cuts(
+    lp,
+    f_values,
+    t_values,
+    pair_supports,
+    triple_supports,
+    *,
+    max_paths,
+    existing_cut_keys,
+    family_name,
+    tolerance,
+    max_template_cuts,
+    validate_templates,
+):
+    t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
+    heap = []
+    sequence = 0
+    candidates = 0
+    invalid = 0
+    emitted = set()
+    path_pattern_cache = {}
+    paths_by_word = {}
+    triple_shapes = sorted(triple_supports)
+    for left_idx, left_shape in enumerate(triple_shapes):
+        left_set = set(left_shape)
+        for right_shape in triple_shapes[left_idx + 1 :]:
+            right_set = set(right_shape)
+            intersection = left_set & right_set
+            if len(intersection) != 2:
+                continue
+            union_shape = tuple(sorted(left_set | right_set))
+            if len(union_shape) != 4:
+                continue
+            pair_shape = tuple(sorted((left_set - intersection) | (right_set - intersection)))
+            if pair_shape not in pair_supports:
+                continue
+            token_sum = sum(float(t_values[token_idx]) for token_idx in union_shape)
+            for left_support in triple_supports[left_shape]:
+                for right_support in triple_supports[right_shape]:
+                    if right_support["word"] == left_support["word"]:
+                        continue
+                    for pair_support in pair_supports[pair_shape]:
+                        words = (left_support["word"], right_support["word"], pair_support["word"])
+                        if len(set(words)) < 3:
+                            continue
+                        candidates += 1
+                        columns = left_support["columns"] + right_support["columns"] + pair_support["columns"]
+                        edge_sum = float(f_values[list(columns)].sum())
+                        violation = edge_sum - token_sum - 1.0
+                        if violation <= tolerance:
+                            continue
+                        if max_template_cuts > 0 and len(heap) >= max_template_cuts and violation <= heap[0][0]:
+                            continue
+                        coefficient_key = (left_shape, right_shape, pair_shape, tuple(sorted(columns)))
+                        if coefficient_key in emitted:
+                            continue
+                        full_key = (family_name, union_shape, tuple(sorted(words)), coefficient_key)
+                        if full_key in existing_cut_keys:
+                            continue
+                        if validate_templates:
+                            max_slack = validate_template_cut(
+                                lp,
+                                words,
+                                union_shape,
+                                columns,
+                                max_paths=max_paths,
+                                path_pattern_cache=path_pattern_cache,
+                                paths_by_word=paths_by_word,
+                            )
+                            if max_slack is None or max_slack > 1e-7:
+                                invalid += 1
+                                continue
+                        emitted.add(coefficient_key)
+                        entries = [(col_idx, 1.0) for col_idx in columns]
+                        entries.extend((t_offset + token_idx, -1.0) for token_idx in union_shape)
+                        cut = (float(violation), full_key, entries, 1.0)
+                        if max_template_cuts > 0:
+                            if len(heap) < max_template_cuts:
+                                heapq.heappush(heap, (float(violation), sequence, cut))
+                                sequence += 1
+                            else:
+                                heapq.heapreplace(heap, (float(violation), sequence, cut))
+                                sequence += 1
+                        else:
+                            heap.append((float(violation), sequence, cut))
+                            sequence += 1
+    violations = [row[2] for row in sorted(heap, key=lambda item: item[0], reverse=True)]
+    return violations, candidates, invalid
+
+
+def validate_template_cut(
+    lp,
+    word_indices,
+    selected_tokens,
+    columns,
+    *,
+    max_paths,
+    path_pattern_cache,
+    paths_by_word,
+):
+    selected_position = {token_idx: idx for idx, token_idx in enumerate(selected_tokens)}
+    selected_set = set(selected_tokens)
+    col_position = {int(col_idx): idx for idx, col_idx in enumerate(columns)}
+    signatures = []
+    for word_idx in word_indices:
+        if word_idx not in paths_by_word:
+            paths_by_word[word_idx] = enumerate_word_edge_paths_by_pattern(
+                lp,
+                word_idx,
+                max_paths=max_paths,
+                cache=path_pattern_cache,
+            )
+        paths = paths_by_word[word_idx]
+        if paths is None:
+            return None
+        signatures.append(
+            projected_pair_hull_path_signatures(
+                paths,
+                selected_set,
+                selected_position,
+                col_position,
+            )
+        )
+    max_slack = -float("inf")
+    for first_edges, first_mask in signatures[0]:
+        for second_edges, second_mask in signatures[1]:
+            pair_edges = first_edges + second_edges
+            pair_mask = first_mask | second_mask
+            for third_edges, third_mask in signatures[2]:
+                token_mask = pair_mask | third_mask
+                lhs = len(pair_edges) + len(third_edges) - int(token_mask.bit_count())
+                max_slack = max(max_slack, float(lhs - 1.0))
+                if max_slack > 1e-7:
+                    return max_slack
+    return max_slack
+
+
+def template_cut_max_lhs(
+    lp,
+    word_indices,
+    selected_tokens,
+    edge_coefficients,
+    token_coefficients,
+    *,
+    max_paths,
+    path_pattern_cache,
+    paths_by_word,
+):
+    selected_tokens = tuple(int(token_idx) for token_idx in selected_tokens)
+    selected_position = {token_idx: idx for idx, token_idx in enumerate(selected_tokens)}
+    selected_set = set(selected_tokens)
+    columns = tuple(sorted(int(col_idx) for col_idx in edge_coefficients))
+    col_position = {col_idx: idx for idx, col_idx in enumerate(columns)}
+    signatures = []
+    for word_idx in word_indices:
+        word_idx = int(word_idx)
+        if word_idx not in paths_by_word:
+            paths_by_word[word_idx] = enumerate_word_edge_paths_by_pattern(
+                lp,
+                word_idx,
+                max_paths=max_paths,
+                cache=path_pattern_cache,
+            )
+        paths = paths_by_word[word_idx]
+        if paths is None:
+            return None
+        signatures.append(
+            projected_pair_hull_path_signatures(
+                paths,
+                selected_set,
+                selected_position,
+                col_position,
+            )
+        )
+
+    positive_token_sum = sum(max(0.0, float(token_coefficients.get(token_idx, 0.0))) for token_idx in selected_tokens)
+    max_lhs = -float("inf")
+
+    def visit(signature_idx, kept_positions, token_mask):
+        nonlocal max_lhs
+        if signature_idx == len(signatures):
+            lhs = positive_token_sum
+            for pos in kept_positions:
+                lhs += float(edge_coefficients.get(columns[pos], 0.0))
+            for pos, token_idx in enumerate(selected_tokens):
+                if token_mask & (1 << pos):
+                    lhs += min(0.0, float(token_coefficients.get(token_idx, 0.0)))
+            max_lhs = max(max_lhs, lhs)
+            return
+        for path_positions, path_mask in signatures[signature_idx]:
+            visit(signature_idx + 1, kept_positions + path_positions, token_mask | path_mask)
+
+    visit(0, tuple(), 0)
+    return max_lhs
 
 
 def word_support_selected_tokens(lp, f_values, t_values, word_idx: int, *, max_rank: int, tolerance: float):
@@ -3909,6 +5775,472 @@ def pair_full_upward_hull_cut_from_paths(
         build_seconds,
         solve_seconds,
     )
+
+
+def pair_reduced_fractional_edge_hull_cut_from_paths(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    left_word_idx: int,
+    right_word_idx: int,
+    selected_tokens: tuple[int, ...],
+    left_paths,
+    right_paths,
+    *,
+    tolerance: float,
+    max_pair_rows: int,
+):
+    num_f = lp["num_nonfree_edges"]
+    selected_position = {token_idx: idx for idx, token_idx in enumerate(selected_tokens)}
+    selected_set = set(selected_tokens)
+    word_columns = []
+    current_values = []
+    for word_idx in (left_word_idx, right_word_idx):
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            value = float(f_values[edge_idx])
+            if tolerance < value < 1.0 - tolerance:
+                word_columns.append(edge_idx)
+                current_values.append(value)
+        for edge_idx in lp["word_free_edges"].get(word_idx, []):
+            value = float(g_values[edge_idx])
+            if tolerance < value < 1.0 - tolerance:
+                word_columns.append(num_f + edge_idx)
+                current_values.append(value)
+
+    build_start = time.monotonic()
+    col_position = {col_idx: idx for idx, col_idx in enumerate(word_columns)}
+    num_edge_vars = len(word_columns)
+    num_token_vars = len(selected_tokens)
+    a_pos_offset = 0
+    a_neg_offset = num_edge_vars
+    b_pos_offset = 2 * num_edge_vars
+    b_neg_offset = b_pos_offset + num_token_vars
+    gamma_col = b_neg_offset + num_token_vars
+    num_vars = gamma_col + 1
+
+    left_signatures = projected_pair_hull_path_signatures(
+        left_paths,
+        selected_set,
+        selected_position,
+        col_position,
+    )
+    right_signatures = projected_pair_hull_path_signatures(
+        right_paths,
+        selected_set,
+        selected_position,
+        col_position,
+    )
+    pair_row_keys = []
+    pair_row_key_set = set()
+    limit_hit = False
+    for left_kept, left_mask in left_signatures:
+        for right_kept, right_mask in right_signatures:
+            row_key = (left_kept + right_kept, left_mask | right_mask)
+            if row_key in pair_row_key_set:
+                continue
+            if max_pair_rows > 0 and len(pair_row_keys) >= max_pair_rows:
+                limit_hit = True
+                break
+            pair_row_key_set.add(row_key)
+            pair_row_keys.append(row_key)
+        if limit_hit:
+            break
+
+    rows = []
+    cols = []
+    data = []
+    rhs = []
+    for row_idx, (kept_positions, token_mask) in enumerate(pair_row_keys):
+        for pos in kept_positions:
+            rows.extend((row_idx, row_idx))
+            cols.extend((a_pos_offset + pos, a_neg_offset + pos))
+            data.extend((1.0, -1.0))
+        for pos in range(num_token_vars):
+            rows.append(row_idx)
+            cols.append(b_pos_offset + pos)
+            data.append(1.0)
+            if token_mask & (1 << pos):
+                rows.append(row_idx)
+                cols.append(b_neg_offset + pos)
+                data.append(-1.0)
+        rows.append(row_idx)
+        cols.append(gamma_col)
+        data.append(1.0)
+        rhs.append(0.0)
+
+    row_idx = len(pair_row_keys)
+
+    if limit_hit:
+        return {
+            "skip_reason": "reduced_rows",
+            "build_seconds": time.monotonic() - build_start,
+            "solve_seconds": 0.0,
+            "validation_seconds": 0.0,
+            "reduced_rows": row_idx,
+            "edge_vars": num_edge_vars,
+            "left_signatures": len(left_signatures),
+            "right_signatures": len(right_signatures),
+        }
+
+    norm_row = row_idx
+    for pos in range(num_edge_vars):
+        rows.extend((norm_row, norm_row))
+        cols.extend((a_pos_offset + pos, a_neg_offset + pos))
+        data.extend((1.0, 1.0))
+    for pos in range(num_token_vars):
+        rows.extend((norm_row, norm_row))
+        cols.extend((b_pos_offset + pos, b_neg_offset + pos))
+        data.extend((1.0, 1.0))
+    rhs.append(1.0)
+
+    constraints = sp.coo_matrix(
+        (data, (rows, cols)),
+        shape=(row_idx + 1, num_vars),
+        dtype=float,
+    ).tocsr()
+    objective = np.zeros(num_vars, dtype=float)
+    for pos, value in enumerate(current_values):
+        objective[a_pos_offset + pos] = -value
+        objective[a_neg_offset + pos] = value
+    for pos, token_idx in enumerate(selected_tokens):
+        token_value = float(t_values[token_idx])
+        objective[b_pos_offset + pos] = -token_value
+        objective[b_neg_offset + pos] = token_value
+    objective[gamma_col] = -1.0
+    bounds = [(0.0, None)] * num_vars
+    bounds[gamma_col] = (None, None)
+    build_seconds = time.monotonic() - build_start
+
+    solve_start = time.monotonic()
+    result = linprog(
+        c=objective,
+        A_ub=constraints,
+        b_ub=np.array(rhs, dtype=float),
+        bounds=bounds,
+        method="highs",
+    )
+    solve_seconds = time.monotonic() - solve_start
+    base = {
+        "skip_reason": None,
+        "build_seconds": build_seconds,
+        "solve_seconds": solve_seconds,
+        "validation_seconds": 0.0,
+        "reduced_rows": row_idx,
+        "edge_vars": num_edge_vars,
+        "left_signatures": len(left_signatures),
+        "right_signatures": len(right_signatures),
+    }
+    if not result.success:
+        base["skip_reason"] = "linprog"
+        return base
+
+    reduced_violation = -float(result.fun)
+    if reduced_violation <= tolerance:
+        return base
+
+    edge_coefficients = {}
+    for col_idx, pos in col_position.items():
+        coefficient = float(result.x[a_pos_offset + pos] - result.x[a_neg_offset + pos])
+        if abs(coefficient) > 1e-10:
+            edge_coefficients[int(col_idx)] = coefficient
+    token_coefficients = {}
+    for token_idx, pos in selected_position.items():
+        coefficient = float(result.x[b_pos_offset + pos] - result.x[b_neg_offset + pos])
+        if abs(coefficient) > 1e-10:
+            token_coefficients[int(token_idx)] = coefficient
+    rhs_value = -float(result.x[gamma_col])
+
+    validation_start = time.monotonic()
+    max_slack = pair_hull_max_projected_row_slack(
+        edge_coefficients,
+        token_coefficients,
+        rhs_value,
+        selected_tokens,
+        pair_row_keys,
+        word_columns,
+    )
+    current_violation = pair_hull_current_violation(
+        edge_coefficients,
+        token_coefficients,
+        rhs_value,
+        selected_tokens,
+        f_values,
+        g_values,
+        t_values,
+        num_f,
+    )
+    base["validation_seconds"] = time.monotonic() - validation_start
+    if max_slack > 1e-7 or current_violation <= tolerance:
+        base["skip_reason"] = "invalid_reduced_cut"
+        return base
+
+    coefficient_key = (
+        "fractional_edges_shared_colors",
+        round(-rhs_value, 8),
+        tuple(round(float(token_coefficients.get(token_idx, 0.0)), 8) for token_idx in selected_tokens),
+        tuple(sorted((int(col_idx), round(float(coefficient), 8)) for col_idx, coefficient in edge_coefficients.items())),
+    )
+    base.update(
+        {
+            "violation": float(current_violation),
+            "edge_coefficients": edge_coefficients,
+            "token_coefficients": token_coefficients,
+            "rhs": rhs_value,
+            "coefficient_key": coefficient_key,
+        }
+    )
+    return base
+
+
+def triple_reduced_fractional_edge_hull_cut_from_paths(
+    lp,
+    f_values,
+    g_values,
+    t_values,
+    word_indices: tuple[int, int, int],
+    selected_tokens: tuple[int, ...],
+    paths_list,
+    *,
+    tolerance: float,
+    max_rows: int,
+):
+    num_f = lp["num_nonfree_edges"]
+    selected_position = {token_idx: idx for idx, token_idx in enumerate(selected_tokens)}
+    selected_set = set(selected_tokens)
+    word_columns = []
+    current_values = []
+    for word_idx in word_indices:
+        for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            value = float(f_values[edge_idx])
+            if tolerance < value < 1.0 - tolerance:
+                word_columns.append(int(edge_idx))
+                current_values.append(value)
+        for edge_idx in lp["word_free_edges"].get(word_idx, []):
+            value = float(g_values[edge_idx])
+            if tolerance < value < 1.0 - tolerance:
+                word_columns.append(int(num_f + edge_idx))
+                current_values.append(value)
+
+    build_start = time.monotonic()
+    col_position = {col_idx: idx for idx, col_idx in enumerate(word_columns)}
+    signatures = [
+        projected_pair_hull_path_signatures(paths, selected_set, selected_position, col_position)
+        for paths in paths_list
+    ]
+    signatures.sort(key=len)
+    pair_keys = set()
+    for first_edges, first_mask in signatures[0]:
+        for second_edges, second_mask in signatures[1]:
+            pair_keys.add((first_edges + second_edges, first_mask | second_mask))
+    row_keys = []
+    row_key_set = set()
+    limit_hit = False
+    for pair_edges, pair_mask in pair_keys:
+        for third_edges, third_mask in signatures[2]:
+            row_key = (pair_edges + third_edges, pair_mask | third_mask)
+            if row_key in row_key_set:
+                continue
+            if max_rows > 0 and len(row_keys) >= max_rows:
+                limit_hit = True
+                break
+            row_key_set.add(row_key)
+            row_keys.append(row_key)
+        if limit_hit:
+            break
+
+    num_edge_vars = len(word_columns)
+    num_token_vars = len(selected_tokens)
+    a_pos_offset = 0
+    a_neg_offset = num_edge_vars
+    b_pos_offset = 2 * num_edge_vars
+    b_neg_offset = b_pos_offset + num_token_vars
+    gamma_col = b_neg_offset + num_token_vars
+    num_vars = gamma_col + 1
+
+    if limit_hit:
+        return {
+            "skip_reason": "reduced_rows",
+            "build_seconds": time.monotonic() - build_start,
+            "solve_seconds": 0.0,
+            "validation_seconds": 0.0,
+            "reduced_rows": len(row_keys),
+            "edge_vars": num_edge_vars,
+        }
+
+    rows = []
+    cols = []
+    data = []
+    rhs = []
+    for row_idx, (kept_positions, token_mask) in enumerate(row_keys):
+        for pos in kept_positions:
+            rows.extend((row_idx, row_idx))
+            cols.extend((a_pos_offset + pos, a_neg_offset + pos))
+            data.extend((1.0, -1.0))
+        for pos in range(num_token_vars):
+            rows.append(row_idx)
+            cols.append(b_pos_offset + pos)
+            data.append(1.0)
+            if token_mask & (1 << pos):
+                rows.append(row_idx)
+                cols.append(b_neg_offset + pos)
+                data.append(-1.0)
+        rows.append(row_idx)
+        cols.append(gamma_col)
+        data.append(1.0)
+        rhs.append(0.0)
+
+    norm_row = len(row_keys)
+    for pos in range(num_edge_vars):
+        rows.extend((norm_row, norm_row))
+        cols.extend((a_pos_offset + pos, a_neg_offset + pos))
+        data.extend((1.0, 1.0))
+    for pos in range(num_token_vars):
+        rows.extend((norm_row, norm_row))
+        cols.extend((b_pos_offset + pos, b_neg_offset + pos))
+        data.extend((1.0, 1.0))
+    rhs.append(1.0)
+
+    constraints = sp.coo_matrix((data, (rows, cols)), shape=(norm_row + 1, num_vars), dtype=float).tocsr()
+    objective = np.zeros(num_vars, dtype=float)
+    for pos, value in enumerate(current_values):
+        objective[a_pos_offset + pos] = -value
+        objective[a_neg_offset + pos] = value
+    for pos, token_idx in enumerate(selected_tokens):
+        token_value = float(t_values[token_idx])
+        objective[b_pos_offset + pos] = -token_value
+        objective[b_neg_offset + pos] = token_value
+    objective[gamma_col] = -1.0
+    bounds = [(0.0, None)] * num_vars
+    bounds[gamma_col] = (None, None)
+    build_seconds = time.monotonic() - build_start
+
+    solve_start = time.monotonic()
+    result = linprog(
+        c=objective,
+        A_ub=constraints,
+        b_ub=np.array(rhs, dtype=float),
+        bounds=bounds,
+        method="highs",
+    )
+    solve_seconds = time.monotonic() - solve_start
+    base = {
+        "skip_reason": None,
+        "build_seconds": build_seconds,
+        "solve_seconds": solve_seconds,
+        "validation_seconds": 0.0,
+        "reduced_rows": len(row_keys),
+        "edge_vars": num_edge_vars,
+    }
+    if not result.success:
+        base["skip_reason"] = "linprog"
+        return base
+
+    reduced_violation = -float(result.fun)
+    if reduced_violation <= tolerance:
+        return base
+
+    edge_coefficients = {}
+    for col_idx, pos in col_position.items():
+        coefficient = float(result.x[a_pos_offset + pos] - result.x[a_neg_offset + pos])
+        if abs(coefficient) > 1e-10:
+            edge_coefficients[int(col_idx)] = coefficient
+    token_coefficients = {}
+    for token_idx, pos in selected_position.items():
+        coefficient = float(result.x[b_pos_offset + pos] - result.x[b_neg_offset + pos])
+        if abs(coefficient) > 1e-10:
+            token_coefficients[int(token_idx)] = coefficient
+    rhs_value = -float(result.x[gamma_col])
+
+    validation_start = time.monotonic()
+    max_slack = pair_hull_max_projected_row_slack(
+        edge_coefficients,
+        token_coefficients,
+        rhs_value,
+        selected_tokens,
+        row_keys,
+        word_columns,
+    )
+    current_violation = pair_hull_current_violation(
+        edge_coefficients,
+        token_coefficients,
+        rhs_value,
+        selected_tokens,
+        f_values,
+        g_values,
+        t_values,
+        num_f,
+    )
+    base["validation_seconds"] = time.monotonic() - validation_start
+    if max_slack > 1e-7 or current_violation <= tolerance:
+        base["skip_reason"] = "invalid_reduced_cut"
+        return base
+
+    coefficient_key = (
+        "fractional_edges_shared_colors",
+        round(-rhs_value, 8),
+        tuple(round(float(token_coefficients.get(token_idx, 0.0)), 8) for token_idx in selected_tokens),
+        tuple(sorted((int(col_idx), round(float(coefficient), 8)) for col_idx, coefficient in edge_coefficients.items())),
+    )
+    base.update(
+        {
+            "violation": float(current_violation),
+            "edge_coefficients": edge_coefficients,
+            "token_coefficients": token_coefficients,
+            "rhs": rhs_value,
+            "coefficient_key": coefficient_key,
+        }
+    )
+    return base
+
+
+def projected_pair_hull_path_signatures(paths, selected_set, selected_position, col_position):
+    signatures = set()
+    for path_columns, path_tokens in paths:
+        kept_positions = tuple(sorted(col_position[col_idx] for col_idx in path_columns if col_idx in col_position))
+        token_mask = 0
+        for token_idx in set(path_tokens) & selected_set:
+            token_mask |= 1 << selected_position[token_idx]
+        signatures.add((kept_positions, token_mask))
+    return tuple(signatures)
+
+
+def pair_hull_max_projected_row_slack(edge_coefficients, token_coefficients, rhs, selected_tokens, pair_row_keys, word_columns):
+    positive_token_sum = sum(max(0.0, float(token_coefficients.get(token_idx, 0.0))) for token_idx in selected_tokens)
+    max_slack = -float("inf")
+    for kept_positions, token_mask in pair_row_keys:
+        lhs = positive_token_sum
+        for pos in kept_positions:
+            lhs += float(edge_coefficients.get(int(word_columns[pos]), 0.0))
+        for pos, token_idx in enumerate(selected_tokens):
+            if token_mask & (1 << pos):
+                lhs += min(0.0, float(token_coefficients.get(token_idx, 0.0)))
+        max_slack = max(max_slack, lhs - rhs)
+    return max_slack
+
+
+def pair_hull_current_violation(edge_coefficients, token_coefficients, rhs, selected_tokens, f_values, g_values, t_values, num_f):
+    lhs = 0.0
+    for col_idx, coefficient in edge_coefficients.items():
+        if col_idx < num_f:
+            lhs += coefficient * float(f_values[col_idx])
+        else:
+            lhs += coefficient * float(g_values[col_idx - num_f])
+    for token_idx in selected_tokens:
+        lhs += float(token_coefficients.get(token_idx, 0.0)) * float(t_values[token_idx])
+    return lhs - rhs
+
+
+def small_quantile_summary(values):
+    if not values:
+        return None
+    arr = np.asarray(values, dtype=float)
+    return {
+        "min": float(np.min(arr)),
+        "p50": float(np.quantile(arr, 0.5)),
+        "p90": float(np.quantile(arr, 0.9)),
+        "max": float(np.max(arr)),
+    }
 
 
 def separate_bad_vocab_escape_cut_specs(

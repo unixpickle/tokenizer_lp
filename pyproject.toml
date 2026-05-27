@@ -22,6 +22,13 @@ tokenizer-lp-pair-hull-diagnostics = "tokenisation_lp.pair_hull_diagnostics:main
 tokenizer-lp-alternative-pairs = "tokenisation_lp.alternative_pair_diagnostics:main"
 tokenizer-lp-pair-cut-impact = "tokenisation_lp.pair_cut_impact:main"
 tokenizer-lp-triplet-hulls = "tokenisation_lp.triplet_hull_diagnostics:main"
+tokenizer-lp-next-pair-cuts = "tokenisation_lp.next_pair_cut_analysis:main"
+tokenizer-lp-shared-fractional-pairs = "tokenisation_lp.shared_fractional_pair_test:main"
+tokenizer-lp-edge-ablation = "tokenisation_lp.edge_coefficient_ablation:main"
+tokenizer-lp-reduced-edge-pair-scan = "tokenisation_lp.reduced_edge_pair_scan:main"
+tokenizer-lp-cut-frontier = "tokenisation_lp.cut_frontier_exploration:main"
+tokenizer-lp-triple-cut-diagnostics = "tokenisation_lp.triple_cut_diagnostics:main"
+tokenizer-lp-pair-cut-templates = "tokenisation_lp.pair_cut_template_diagnostics:main"
 
 [build-system]
 requires = ["hatchling"]
