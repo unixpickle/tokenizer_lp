@@ -2220,3 +2220,109 @@ uv run tokenizer-lp-plot-log-bounds \
   /tmp/tokenizer_lp_books_5k_pair_mixed_min2_roundshuffle_100/run.log \
   --output experiments/plots/books_5k_pair_mixed_min2_roundshuffle_100_bounds.png
 ```
+
+### Books 512 LP, Template Search Then Random Brute-Force Resume
+
+I added resumable state for large LP-cut experiments, random top-k score
+options for the template separators, an efficient 5-cycle separator, and
+separate `short_word_pair_hull` / `short_word_triple_hull` brute-force LP
+passes with reduced edge/color projections. The current long-running books
+experiment lives at:
+
+| artifact | path |
+|---|---|
+| run directory | `/tmp/tokenizer_lp_books_512_reduced_random_8xpool_50kcuts_sigproj_10rounds` |
+| brute-force pair/triple log | `/tmp/tokenizer_lp_books_512_reduced_random_8xpool_50kcuts_sigproj_10rounds/run_bruteforce_pair_triple_random_50k.log` |
+| 80-window CMA log | `/tmp/tokenizer_lp_books_512_reduced_random_8xpool_50kcuts_sigproj_10rounds/cma_rounding_pop128_10k.log` |
+| full-window CMA log | `/tmp/tokenizer_lp_books_512_reduced_random_8xpool_50kcuts_sigproj_10rounds/cma_rounding_pop128_10k_window0.log` |
+| full-window CMA tokenizer | `/tmp/tokenizer_lp_books_512_reduced_random_8xpool_50kcuts_sigproj_10rounds/lp/cma_rounding_pop128_10k_window0_tokenizer.json` |
+
+Current process state, as of 2026-05-28:
+
+| process | state |
+|---|---|
+| `tokenizer_lp_bruteforce_50k` | running in tmux, solving after checkpoint `next_iteration=67` |
+| `tokenizer_lp_cma_pop128_10k` | completed |
+| `tokenizer_lp_cma_pop128_10k_window0` | completed |
+
+The last template-only rounds used random word/support/candidate sampling,
+length 16, 16 supports per 5-cycle edge, and 256 sampled 5-cycle support
+assignments. Returns dropped sharply:
+
+| Iteration | Lower Bound | Active Cuts | Next Cuts | Max Cut Violation | Notes |
+|---:|---:|---:|---:|---:|---|
+| 59 | 259,414.779 | 614,140 | 30,000 | 0.389497 | first widened 5-cycle run |
+| 60 | 259,417.738 | 644,140 | 30,000 | 0.160713 | still saturated 30k cap |
+| 61 | 259,419.405 | 674,140 | 6,250 | 0.142857 | returns dropped |
+| 62 | 259,419.810 | 680,390 | 1,412 | 0.111111 | near template wall |
+| 63 | 259,420.074 | 681,802 | 4,990 | 0.120623 | random sample found a few more |
+| 64 | 259,420.127 | 686,792 | 1,435 | 0.084788 | diminishing |
+| 65 | 259,420.174 | 688,227 | 29 | 0.101449 | effectively exhausted |
+
+I then resumed the same checkpoint using brute-force pair and triplet LP
+separation instead of templates:
+
+```bash
+uv run tokenizer-lp-train \
+  --data-dir /Users/alex/Desktop/books \
+  --output-dir /tmp/tokenizer_lp_books_512_reduced_random_8xpool_50kcuts_sigproj_10rounds \
+  --kind lp \
+  --vocab-size 512 \
+  --pretokenizer nanochat \
+  --min-token-count 5 \
+  --max-token-length 8 \
+  --lp-solver highspy \
+  --lp-cut-rounds 1000 \
+  --lp-cuts-per-round 50000 \
+  --lp-cut-families short_word_pair_hull,short_word_triple_hull \
+  --lp-run-all-cut-families \
+  --lp-word-support-max-paths 100000 \
+  --lp-short-word-pair-hull-max-words 1200 \
+  --lp-short-word-pair-hull-max-length 16 \
+  --lp-short-word-pair-hull-max-colors 96 \
+  --lp-short-word-pair-hull-max-pair-rows 500000 \
+  --lp-short-word-pair-hull-max-pairs 50000 \
+  --lp-short-word-pair-hull-top-words-per-color 96 \
+  --lp-short-word-pair-hull-candidate-word-multiplier 8 \
+  --lp-short-word-pair-hull-candidate-top-words-multiplier 4 \
+  --lp-short-word-pair-hull-candidate-strategy random \
+  --lp-short-word-pair-hull-pruning fractional_edges_shared_colors \
+  --lp-short-word-triple-hull-max-words 1200 \
+  --lp-short-word-triple-hull-max-length 16 \
+  --lp-short-word-triple-hull-max-rows 500000 \
+  --lp-short-word-triple-hull-max-triples 50000 \
+  --lp-short-word-triple-hull-top-words-per-color 96 \
+  --lp-short-word-triple-hull-candidate-word-multiplier 8 \
+  --lp-short-word-triple-hull-candidate-top-words-multiplier 4 \
+  --lp-short-word-triple-hull-candidate-sample 500000 \
+  --lp-short-word-triple-hull-token-mode at_least_two
+```
+
+First completed brute-force separation round:
+
+| LP Iteration | Lower Bound | Active Cuts Before | Pair Cuts | Triple Cuts | Next Cuts | Max Cut Violation |
+|---:|---:|---:|---:|---:|---:|---:|
+| 66 | 259,420.224 | 688,256 | 31 | 60 | 91 | 0.0366826 |
+
+Separation timings and reduced projection sizes for iteration 66:
+
+| Family | Tasks | Cuts | Wall Time | Reduced Rows p50 / p90 / max | Edge Vars p50 / p90 / max |
+|---|---:|---:|---:|---|---|
+| pair hull | 50,000 | 31 | 489.049s | 780 / 8,918 / 500,000 | 14 / 20 / 35 |
+| triple hull | 50,000 | 60 | 4,777.747s | 12,178.5 / 232,204 / 500,000 | 21 / 28 / 50 |
+
+The pair LPs remain cheap with the reduced projection; triples are much more
+expensive but still found more cuts than pairs in this late-stage state. The
+run checkpoint after this round is `next_iteration=67`, `active_cuts=688,347`.
+
+I also tested CMA-ES rounding against the latest checkpoint solution:
+
+| Search | Candidate Window | Search Dim | Fixed In | Local Budget | Evals | Best Tokens | Source | Stop |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| local cutoff window | 80 | 80 | 214 | 40 | 3,522 | 259,587 | `cma_g0033` | `tolflatfitness` |
+| full positive candidate set | 0 | 351 | 0 | 254 | 2,066 | 259,579 | `cma_g0047` | `tolflatfitness` |
+
+Both CMA searches used `--popsize 128 --max-evals 10000`; both stopped early
+for flat fitness. The full positive-candidate search improved the deterministic
+rounded tokenizer from 260,373 tokens to 259,579 tokens, leaving a gap of about
+158.78 tokens to the LP lower bound at checkpoint `next_iteration=67`.

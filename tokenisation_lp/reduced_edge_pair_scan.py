@@ -272,6 +272,11 @@ def prepare_tasks(args, lp, f_values, t_values, existing_cut_keys):
         rng.shuffle(pair_rows)
 
     fractional_colors = set(np.flatnonzero((t_values > args.cut_tolerance) & (t_values < 1.0 - args.cut_tolerance)))
+    existing_pair_prefixes = {
+        key[:3]
+        for key in existing_cut_keys
+        if len(key) >= 3 and key[0] == "short_word_pair_hull"
+    }
     colors_by_word = {}
     paths_by_word = {}
     path_pattern_cache = {}
@@ -282,7 +287,7 @@ def prepare_tasks(args, lp, f_values, t_values, existing_cut_keys):
     for _, left_word, right_word in pair_rows:
         if max_pairs > 0 and len(tasks) >= max_pairs:
             break
-        if any(key[:3] == ("short_word_pair_hull", left_word, right_word) for key in existing_cut_keys):
+        if ("short_word_pair_hull", left_word, right_word) in existing_pair_prefixes:
             skipped["existing"] += 1
             continue
         left_colors = colors_by_word.setdefault(left_word, set(all_word_token_colors(lp, left_word)))

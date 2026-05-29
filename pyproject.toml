@@ -32,6 +32,7 @@ tokenizer-lp-reduced-edge-pair-scan = "tokenisation_lp.reduced_edge_pair_scan:ma
 tokenizer-lp-cut-frontier = "tokenisation_lp.cut_frontier_exploration:main"
 tokenizer-lp-triple-cut-diagnostics = "tokenisation_lp.triple_cut_diagnostics:main"
 tokenizer-lp-pair-cut-templates = "tokenisation_lp.pair_cut_template_diagnostics:main"
+tokenizer-lp-higher-order-cuts = "tokenisation_lp.higher_order_cut_diagnostics:main"
 tokenizer-lp-cma-rounding = "tokenisation_lp.cma_rounding_search:main"
 
 [build-system]

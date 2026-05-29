@@ -15,7 +15,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable
+from typing import Callable, Literal
 
 import numpy as np
 import scipy.sparse as sp
@@ -34,6 +34,10 @@ from tokenisation_lp.pretokenization import (
 
 
 LOGGER = logging.getLogger(__name__)
+
+WordTopKScore = Literal["weighted_fractionality", "random"]
+SupportTopKScore = Literal["support_value", "random"]
+CutTopKScore = Literal["violation", "random"]
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,10 @@ class CutSeparationConfig:
     short_word_pair_template_top_supports_per_shape: int = 24
     short_word_pair_template_max_chain_edges: int = 6
     short_word_pair_template_max_cuts: int = 100000
+    short_word_pair_template_word_score: WordTopKScore = "weighted_fractionality"
+    short_word_pair_template_support_score: SupportTopKScore = "support_value"
+    short_word_pair_template_cut_score: CutTopKScore = "violation"
+    short_word_pair_template_random_seed: int = 0
     short_word_triple_hull_max_words: int = 700
     short_word_triple_hull_max_length: int = 12
     short_word_triple_hull_max_rows: int = 200000
@@ -93,6 +101,14 @@ class CutSeparationConfig:
     short_word_triple_template_top_supports_per_shape: int = 24
     short_word_triple_template_max_cuts: int = 100000
     short_word_triple_template_validate: bool = False
+    short_word_5cycle_supports_per_edge: int = 4
+    short_word_5cycle_support_assignments: int = 0
+    short_word_triple_template_word_score: WordTopKScore = "weighted_fractionality"
+    short_word_triple_template_support_score: SupportTopKScore = "support_value"
+    short_word_triple_template_cut_score: CutTopKScore = "violation"
+    short_word_triple_template_random_seed: int = 0
+    cut_selection_score: CutTopKScore = "violation"
+    cut_selection_random_seed: int = 0
     run_all_cut_families: bool = False
 
 
@@ -1116,13 +1132,18 @@ def separate_cuts(
     if max_cuts <= 0:
         return None, np.array([], dtype=float), [], 0.0
     config = config or CutSeparationConfig()
+    cut_selection_rng = random.Random(config.cut_selection_random_seed + 1_000_003 * separation_round)
 
     num_f = lp["num_nonfree_edges"]
     num_g = lp["num_free_edges"]
     f_values = x_values[:num_f]
     t_values = x_values[num_f + num_g :]
 
-    violations = PerFamilyCutList(max_per_extend=max_cuts)
+    violations = PerFamilyCutList(
+        max_per_extend=max_cuts,
+        score_strategy=config.cut_selection_score,
+        rng=cut_selection_rng,
+    )
     family_set = set(families)
     if "boundary" in family_set:
         violations.extend(
@@ -1368,6 +1389,10 @@ def separate_cuts(
                 max_chain_edges=config.short_word_pair_template_max_chain_edges,
                 max_template_cuts=config.short_word_pair_template_max_cuts,
                 max_paths=config.word_support_max_paths,
+                word_score_strategy=config.short_word_pair_template_word_score,
+                support_score_strategy=config.short_word_pair_template_support_score,
+                cut_score_strategy=config.short_word_pair_template_cut_score,
+                random_seed=config.short_word_pair_template_random_seed + 1_000_003 * separation_round,
             )
         )
     if "short_word_pair_bridge_chain" in family_set:
@@ -1387,6 +1412,10 @@ def separate_cuts(
                 max_chain_edges=config.short_word_pair_template_max_chain_edges,
                 max_template_cuts=config.short_word_pair_template_max_cuts,
                 max_paths=config.word_support_max_paths,
+                word_score_strategy=config.short_word_pair_template_word_score,
+                support_score_strategy=config.short_word_pair_template_support_score,
+                cut_score_strategy=config.short_word_pair_template_cut_score,
+                random_seed=config.short_word_pair_template_random_seed + 1_000_003 * separation_round,
             )
         )
     if "short_word_pair_chains" in family_set:
@@ -1406,6 +1435,10 @@ def separate_cuts(
                 max_chain_edges=config.short_word_pair_template_max_chain_edges,
                 max_template_cuts=config.short_word_pair_template_max_cuts,
                 max_paths=config.word_support_max_paths,
+                word_score_strategy=config.short_word_pair_template_word_score,
+                support_score_strategy=config.short_word_pair_template_support_score,
+                cut_score_strategy=config.short_word_pair_template_cut_score,
+                random_seed=config.short_word_pair_template_random_seed + 1_000_003 * separation_round,
             )
         )
     if "short_word_triple_hull" in family_set and (config.run_all_cut_families or not short_word_full_hull_violations):
@@ -1449,6 +1482,12 @@ def separate_cuts(
                 top_supports_per_shape=config.short_word_triple_template_top_supports_per_shape,
                 max_template_cuts=config.short_word_triple_template_max_cuts,
                 validate_templates=config.short_word_triple_template_validate,
+                five_cycle_supports_per_edge=config.short_word_5cycle_supports_per_edge,
+                five_cycle_support_assignments=config.short_word_5cycle_support_assignments,
+                word_score_strategy=config.short_word_triple_template_word_score,
+                support_score_strategy=config.short_word_triple_template_support_score,
+                cut_score_strategy=config.short_word_triple_template_cut_score,
+                random_seed=config.short_word_triple_template_random_seed + 1_000_003 * separation_round,
             )
         )
     if "short_word_triple_4cycle" in family_set:
@@ -1467,6 +1506,36 @@ def separate_cuts(
                 top_supports_per_shape=config.short_word_triple_template_top_supports_per_shape,
                 max_template_cuts=config.short_word_triple_template_max_cuts,
                 validate_templates=config.short_word_triple_template_validate,
+                five_cycle_supports_per_edge=config.short_word_5cycle_supports_per_edge,
+                five_cycle_support_assignments=config.short_word_5cycle_support_assignments,
+                word_score_strategy=config.short_word_triple_template_word_score,
+                support_score_strategy=config.short_word_triple_template_support_score,
+                cut_score_strategy=config.short_word_triple_template_cut_score,
+                random_seed=config.short_word_triple_template_random_seed + 1_000_003 * separation_round,
+            )
+        )
+    if "short_word_5cycle" in family_set:
+        violations.extend(
+            separate_short_word_triple_template_cut_specs(
+                lp,
+                f_values,
+                t_values,
+                existing_cut_keys=existing_cut_keys,
+                tolerance=tolerance,
+                family_name="short_word_5cycle",
+                template="5cycle",
+                max_words=config.short_word_triple_template_max_words,
+                max_word_length=config.short_word_triple_template_max_length,
+                candidate_word_multiplier=config.short_word_triple_template_candidate_word_multiplier,
+                top_supports_per_shape=config.short_word_triple_template_top_supports_per_shape,
+                max_template_cuts=config.short_word_triple_template_max_cuts,
+                validate_templates=config.short_word_triple_template_validate,
+                five_cycle_supports_per_edge=config.short_word_5cycle_supports_per_edge,
+                five_cycle_support_assignments=config.short_word_5cycle_support_assignments,
+                word_score_strategy=config.short_word_triple_template_word_score,
+                support_score_strategy=config.short_word_triple_template_support_score,
+                cut_score_strategy=config.short_word_triple_template_cut_score,
+                random_seed=config.short_word_triple_template_random_seed + 1_000_003 * separation_round,
             )
         )
     if "group_value_deep" in family_set:
@@ -1588,8 +1657,15 @@ def separate_cuts(
     if not violations:
         return None, np.array([], dtype=float), [], 0.0
 
-    violations.sort(key=lambda item: item[0], reverse=True)
-    selected = violations[:max_cuts]
+    selected = select_topk_by_score(
+        violations,
+        max_cuts,
+        score_strategy=config.cut_selection_score,
+        current_strategy="violation",
+        current_key=lambda item: item[0],
+        rng=cut_selection_rng,
+    )
+    selected.sort(key=lambda item: item[0], reverse=True)
     rows = []
     cols = []
     data = []
@@ -1617,20 +1693,30 @@ def separate_cuts(
 
 
 class PerFamilyCutList(list):
-    def __init__(self, *, max_per_extend: int):
+    def __init__(self, *, max_per_extend: int, score_strategy: CutTopKScore, rng: random.Random):
         super().__init__()
         self.max_per_extend = max(0, int(max_per_extend))
+        self.score_strategy = score_strategy
+        self.rng = rng
 
     def extend(self, cuts):
         rows = list(cuts)
         if self.max_per_extend > 0 and len(rows) > self.max_per_extend:
-            rows.sort(key=lambda item: item[0], reverse=True)
-            LOGGER.info(
-                "Limiting one cut family from %d candidate cuts to top %d",
-                len(rows),
+            original_count = len(rows)
+            rows = select_topk_by_score(
+                rows,
                 self.max_per_extend,
+                score_strategy=self.score_strategy,
+                current_strategy="violation",
+                current_key=lambda item: item[0],
+                rng=self.rng,
             )
-            rows = rows[: self.max_per_extend]
+            LOGGER.info(
+                "Limiting one cut family from %d candidate cuts to %d with score=%s",
+                original_count,
+                self.max_per_extend,
+                self.score_strategy,
+            )
         super().extend(rows)
 
 
@@ -2205,7 +2291,10 @@ def rank_short_fractional_words(
     max_words: int,
     max_word_length: int,
     tolerance: float,
+    score_strategy: str = "weighted_fractionality",
+    rng: random.Random | None = None,
 ):
+    validate_topk_score_strategy(score_strategy, "weighted_fractionality")
     rows = []
     for word_idx, edge_indices in lp["word_nonfree_edges"].items():
         word_len = lp["word_lengths"][word_idx]
@@ -2229,8 +2318,100 @@ def rank_short_fractional_words(
             continue
         weight = float(lp["word_weights"][word_idx])
         rows.append((-weight * score, word_len, -weight, word_idx))
-    rows.sort()
+    if score_strategy == "random":
+        rng = rng or random.Random(0)
+        rows.sort(key=lambda row: rng.random())
+    else:
+        rows.sort()
     return [word_idx for _, _, _, word_idx in rows[:max_words]]
+
+
+def validate_topk_score_strategy(score_strategy: str, current_strategy: str) -> None:
+    if score_strategy not in {current_strategy, "random"}:
+        raise ValueError(
+            f"Unsupported top-k score strategy {score_strategy!r}; expected {current_strategy!r} or 'random'."
+        )
+
+
+def select_topk_by_score(
+    rows,
+    limit: int,
+    *,
+    score_strategy: str,
+    current_strategy: str,
+    current_key,
+    rng: random.Random | None = None,
+):
+    validate_topk_score_strategy(score_strategy, current_strategy)
+    rows = list(rows)
+    if limit <= 0 or len(rows) <= limit:
+        if score_strategy == current_strategy:
+            rows.sort(key=current_key, reverse=True)
+        else:
+            rng = rng or random.Random(0)
+            rng.shuffle(rows)
+        return rows
+    if score_strategy == "random":
+        rng = rng or random.Random(0)
+        return rng.sample(rows, limit)
+    rows.sort(key=current_key, reverse=True)
+    return rows[:limit]
+
+
+class CutSelector:
+    def __init__(
+        self,
+        max_cuts: int,
+        *,
+        score_strategy: str,
+        current_strategy: str = "violation",
+        rng: random.Random | None = None,
+    ):
+        validate_topk_score_strategy(score_strategy, current_strategy)
+        self.max_cuts = int(max_cuts)
+        self.score_strategy = score_strategy
+        self.current_strategy = current_strategy
+        self.rng = rng or random.Random(0)
+        self.heap = []
+        self.rows = []
+        self.sequence = 0
+        self.seen = 0
+
+    def add(self, violation: float, cut) -> None:
+        violation = float(violation)
+        if self.max_cuts <= 0:
+            self.rows.append((violation, self.sequence, cut))
+            self.sequence += 1
+            return
+        if self.score_strategy == "random":
+            self.seen += 1
+            if len(self.rows) < self.max_cuts:
+                self.rows.append((violation, self.sequence, cut))
+                self.sequence += 1
+                return
+            replace_idx = self.rng.randrange(self.seen)
+            if replace_idx < self.max_cuts:
+                self.rows[replace_idx] = (violation, self.sequence, cut)
+                self.sequence += 1
+            return
+        if len(self.heap) < self.max_cuts:
+            heapq.heappush(self.heap, (violation, self.sequence, cut))
+            self.sequence += 1
+        elif violation > self.heap[0][0]:
+            heapq.heapreplace(self.heap, (violation, self.sequence, cut))
+            self.sequence += 1
+
+    def full_with_threshold(self, violation: float) -> bool:
+        if self.max_cuts <= 0 or self.score_strategy == "random" or len(self.heap) < self.max_cuts:
+            return False
+        return float(violation) <= self.heap[0][0]
+
+    def cuts(self):
+        if self.score_strategy == self.current_strategy:
+            rows = self.heap if self.max_cuts > 0 else self.rows
+        else:
+            rows = self.rows
+        return [row[2] for row in sorted(rows, key=lambda item: item[0], reverse=True)]
 
 
 def rank_frequent_short_fractional_words(
@@ -4404,12 +4585,17 @@ def separate_short_word_pair_chain_template_cut_specs(
     max_chain_edges: int = 6,
     max_template_cuts: int = 100000,
     max_paths: int = 100000,
+    word_score_strategy: WordTopKScore = "weighted_fractionality",
+    support_score_strategy: SupportTopKScore = "support_value",
+    cut_score_strategy: CutTopKScore = "violation",
+    random_seed: int = 0,
 ):
     """Separate validated pair-chain templates found by brute-force pair LPs."""
 
     start_time = time.monotonic()
     if template not in {"single", "bridge", "both"}:
         raise ValueError(f"Unsupported short_word_pair_chain template {template!r}")
+    rng = random.Random(random_seed)
     candidate_max_words = max(max_words, int(math.ceil(max_words * max(1.0, float(candidate_word_multiplier)))))
     ranked_words = rank_short_fractional_words(
         lp,
@@ -4418,6 +4604,8 @@ def separate_short_word_pair_chain_template_cut_specs(
         max_words=candidate_max_words,
         max_word_length=max_word_length,
         tolerance=tolerance,
+        score_strategy=word_score_strategy,
+        rng=rng,
     )
     single_supports, bridge_supports, skipped = collect_short_word_pair_chain_supports(
         lp,
@@ -4427,6 +4615,8 @@ def separate_short_word_pair_chain_template_cut_specs(
         tolerance=tolerance,
         top_supports_per_shape=top_supports_per_shape,
         max_chain_edges=max_chain_edges,
+        support_score_strategy=support_score_strategy,
+        rng=rng,
     )
     violations = []
     candidates = 0
@@ -4442,6 +4632,8 @@ def separate_short_word_pair_chain_template_cut_specs(
             tolerance=tolerance,
             max_template_cuts=max_template_cuts,
             max_paths=max_paths,
+            cut_score_strategy=cut_score_strategy,
+            rng=rng,
         )
         violations.extend(single_violations)
         candidates += single_candidates
@@ -4457,17 +4649,25 @@ def separate_short_word_pair_chain_template_cut_specs(
             tolerance=tolerance,
             max_template_cuts=max_template_cuts,
             max_paths=max_paths,
+            cut_score_strategy=cut_score_strategy,
+            rng=rng,
         )
         violations.extend(bridge_violations)
         candidates += bridge_candidates
         path_skips += bridge_path_skips
     if max_template_cuts > 0 and len(violations) > max_template_cuts:
-        violations.sort(key=lambda item: item[0], reverse=True)
-        violations = violations[:max_template_cuts]
+        violations = select_topk_by_score(
+            violations,
+            max_template_cuts,
+            score_strategy=cut_score_strategy,
+            current_strategy="violation",
+            current_key=lambda item: item[0],
+            rng=rng,
+        )
     LOGGER.info(
         "%s: template=%s candidate_words=%d single_supports=%d bridge_shapes=%d "
         "candidates=%d cuts=%d path_skips=%d skipped=%s top_supports_per_shape=%d "
-        "max_chain_edges=%d max_template_cuts=%d wall=%.3fs",
+        "max_chain_edges=%d max_template_cuts=%d word_score=%s support_score=%s cut_score=%s wall=%.3fs",
         family_name,
         template,
         candidate_max_words,
@@ -4480,6 +4680,9 @@ def separate_short_word_pair_chain_template_cut_specs(
         top_supports_per_shape,
         max_chain_edges,
         max_template_cuts,
+        word_score_strategy,
+        support_score_strategy,
+        cut_score_strategy,
         time.monotonic() - start_time,
     )
     return violations
@@ -4494,6 +4697,8 @@ def collect_short_word_pair_chain_supports(
     tolerance: float,
     top_supports_per_shape: int,
     max_chain_edges: int,
+    support_score_strategy: SupportTopKScore,
+    rng: random.Random,
 ):
     single_supports = []
     bridge_by_shape_word = {}
@@ -4522,7 +4727,14 @@ def collect_short_word_pair_chain_supports(
             skipped["no_edges"] += 1
             continue
         for start in list(edges_by_start):
-            edges_by_start[start].sort(key=lambda edge: edge["value"], reverse=True)
+            edges_by_start[start] = select_topk_by_score(
+                edges_by_start[start],
+                4,
+                score_strategy=support_score_strategy,
+                current_strategy="support_value",
+                current_key=lambda edge: edge["value"],
+                rng=rng,
+            )
             del edges_by_start[start][4:]
 
         for start in sorted(edges_by_start):
@@ -4534,11 +4746,26 @@ def collect_short_word_pair_chain_supports(
                     single_supports,
                     bridge_by_shape_word,
                     max_chain_edges=max_chain_edges,
+                    support_score_strategy=support_score_strategy,
+                    rng=rng,
                 )
 
-    bridge_supports = finalize_template_supports(bridge_by_shape_word, top_supports_per_shape)
-    single_supports.sort(key=lambda row: row["value"], reverse=True)
-    return single_supports[: max(1, int(top_supports_per_shape)) * max(1, len(word_indices))], bridge_supports, skipped
+    bridge_supports = finalize_template_supports(
+        bridge_by_shape_word,
+        top_supports_per_shape,
+        support_score_strategy=support_score_strategy,
+        rng=rng,
+    )
+    single_support_limit = max(1, int(top_supports_per_shape)) * max(1, len(word_indices))
+    single_supports = select_topk_by_score(
+        single_supports,
+        single_support_limit,
+        score_strategy=support_score_strategy,
+        current_strategy="support_value",
+        current_key=lambda row: row["value"],
+        rng=rng,
+    )
+    return single_supports, bridge_supports, skipped
 
 
 def visit_pair_chain_supports(
@@ -4549,6 +4776,8 @@ def visit_pair_chain_supports(
     bridge_by_shape_word,
     *,
     max_chain_edges,
+    support_score_strategy,
+    rng,
 ):
     if len(chain) >= 2:
         first_token = int(chain[0]["token"])
@@ -4570,7 +4799,14 @@ def visit_pair_chain_supports(
         if first_token == last_token and len(chain) >= 4:
             single_supports.append(support)
         elif first_token != last_token:
-            keep_best_support_for_word(bridge_by_shape_word, tuple(sorted((first_token, last_token))), word_idx, support)
+            keep_best_support_for_word(
+                bridge_by_shape_word,
+                tuple(sorted((first_token, last_token))),
+                word_idx,
+                support,
+                support_score_strategy=support_score_strategy,
+                rng=rng,
+            )
     if len(chain) >= max_chain_edges:
         return
     next_start = int(chain[-1]["start"]) + 1
@@ -4583,6 +4819,8 @@ def visit_pair_chain_supports(
                 single_supports,
                 bridge_by_shape_word,
                 max_chain_edges=max_chain_edges,
+                support_score_strategy=support_score_strategy,
+                rng=rng,
             )
 
 
@@ -4597,10 +4835,11 @@ def separate_single_chain_template_cuts(
     tolerance,
     max_template_cuts,
     max_paths,
+    cut_score_strategy: CutTopKScore,
+    rng: random.Random,
 ):
     t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
-    heap = []
-    sequence = 0
+    selector = CutSelector(max_template_cuts, score_strategy=cut_score_strategy, rng=rng)
     candidates = 0
     path_skips = 0
     emitted = set()
@@ -4641,18 +4880,8 @@ def separate_single_chain_template_cuts(
         entries = [(col_idx, 1.0) for col_idx in columns]
         entries.append((t_offset + selected_tokens[0], -1.0))
         cut = (float(violation), full_key, entries, float(rhs))
-        if max_template_cuts > 0:
-            if len(heap) < max_template_cuts:
-                heapq.heappush(heap, (float(violation), sequence, cut))
-                sequence += 1
-            elif violation > heap[0][0]:
-                heapq.heapreplace(heap, (float(violation), sequence, cut))
-                sequence += 1
-        else:
-            heap.append((float(violation), sequence, cut))
-            sequence += 1
-    violations = [row[2] for row in sorted(heap, key=lambda item: item[0], reverse=True)]
-    return violations, candidates, path_skips
+        selector.add(float(violation), cut)
+    return selector.cuts(), candidates, path_skips
 
 
 def separate_bridge_chain_template_cuts(
@@ -4666,10 +4895,11 @@ def separate_bridge_chain_template_cuts(
     tolerance,
     max_template_cuts,
     max_paths,
+    cut_score_strategy: CutTopKScore,
+    rng: random.Random,
 ):
     t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
-    heap = []
-    sequence = 0
+    selector = CutSelector(max_template_cuts, score_strategy=cut_score_strategy, rng=rng)
     candidates = 0
     path_skips = 0
     emitted = set()
@@ -4716,18 +4946,8 @@ def separate_bridge_chain_template_cuts(
                 entries = [(col_idx, 1.0) for col_idx in columns]
                 entries.extend((t_offset + token_idx, -1.0) for token_idx in selected_tokens)
                 cut = (float(violation), full_key, entries, float(rhs))
-                if max_template_cuts > 0:
-                    if len(heap) < max_template_cuts:
-                        heapq.heappush(heap, (float(violation), sequence, cut))
-                        sequence += 1
-                    elif violation > heap[0][0]:
-                        heapq.heapreplace(heap, (float(violation), sequence, cut))
-                        sequence += 1
-                else:
-                    heap.append((float(violation), sequence, cut))
-                    sequence += 1
-    violations = [row[2] for row in sorted(heap, key=lambda item: item[0], reverse=True)]
-    return violations, candidates, path_skips
+                selector.add(float(violation), cut)
+    return selector.cuts(), candidates, path_skips
 
 
 def separate_short_word_triple_template_cut_specs(
@@ -4745,12 +4965,19 @@ def separate_short_word_triple_template_cut_specs(
     top_supports_per_shape: int = 24,
     max_template_cuts: int = 100000,
     validate_templates: bool = False,
+    five_cycle_supports_per_edge: int = 4,
+    five_cycle_support_assignments: int = 0,
+    word_score_strategy: WordTopKScore = "weighted_fractionality",
+    support_score_strategy: SupportTopKScore = "support_value",
+    cut_score_strategy: CutTopKScore = "violation",
+    random_seed: int = 0,
 ):
     """Separate fixed small hypergraph templates found by the triplet LP separator."""
 
     start_time = time.monotonic()
-    if template not in {"triangle", "4cycle"}:
+    if template not in {"triangle", "4cycle", "5cycle"}:
         raise ValueError(f"Unsupported short_word_triple template {template!r}")
+    rng = random.Random(random_seed)
     candidate_max_words = max(max_words, int(math.ceil(max_words * max(1.0, float(candidate_word_multiplier)))))
     ranked_words = rank_short_fractional_words(
         lp,
@@ -4759,6 +4986,8 @@ def separate_short_word_triple_template_cut_specs(
         max_words=candidate_max_words,
         max_word_length=max_word_length,
         tolerance=tolerance,
+        score_strategy=word_score_strategy,
+        rng=rng,
     )
     pair_supports, triple_supports, skipped = collect_short_word_template_supports(
         lp,
@@ -4768,6 +4997,8 @@ def separate_short_word_triple_template_cut_specs(
         tolerance=tolerance,
         top_supports_per_shape=top_supports_per_shape,
         need_triples=template == "4cycle",
+        support_score_strategy=support_score_strategy,
+        rng=rng,
     )
     if template == "triangle":
         violations, candidates, invalid = separate_triangle_template_cuts(
@@ -4781,8 +5012,10 @@ def separate_short_word_triple_template_cut_specs(
             tolerance=tolerance,
             max_template_cuts=max_template_cuts,
             validate_templates=validate_templates,
+            cut_score_strategy=cut_score_strategy,
+            rng=rng,
         )
-    else:
+    elif template == "4cycle":
         violations, candidates, invalid = separate_4cycle_template_cuts(
             lp,
             f_values,
@@ -4795,11 +5028,31 @@ def separate_short_word_triple_template_cut_specs(
             tolerance=tolerance,
             max_template_cuts=max_template_cuts,
             validate_templates=validate_templates,
+            cut_score_strategy=cut_score_strategy,
+            rng=rng,
+        )
+    else:
+        violations, candidates, invalid = separate_5cycle_template_cuts(
+            lp,
+            f_values,
+            t_values,
+            pair_supports,
+            max_paths=100000,
+            existing_cut_keys=existing_cut_keys,
+            family_name=family_name,
+            tolerance=tolerance,
+            max_template_cuts=max_template_cuts,
+            validate_templates=validate_templates,
+            support_limit_per_edge=five_cycle_supports_per_edge,
+            support_assignment_sample=five_cycle_support_assignments,
+            cut_score_strategy=cut_score_strategy,
+            rng=rng,
         )
     LOGGER.info(
         "%s: template=%s candidate_words=%d pair_shapes=%d triple_shapes=%d candidates=%d "
         "cuts=%d invalid=%d skipped=%s top_supports_per_shape=%d max_template_cuts=%d "
-        "validate=%s wall=%.3fs",
+        "five_cycle_supports_per_edge=%d five_cycle_support_assignments=%d "
+        "word_score=%s support_score=%s cut_score=%s validate=%s wall=%.3fs",
         family_name,
         template,
         candidate_max_words,
@@ -4811,6 +5064,11 @@ def separate_short_word_triple_template_cut_specs(
         dict(skipped),
         top_supports_per_shape,
         max_template_cuts,
+        five_cycle_supports_per_edge,
+        five_cycle_support_assignments,
+        word_score_strategy,
+        support_score_strategy,
+        cut_score_strategy,
         validate_templates,
         time.monotonic() - start_time,
     )
@@ -4826,6 +5084,8 @@ def collect_short_word_template_supports(
     tolerance: float,
     top_supports_per_shape: int,
     need_triples: bool,
+    support_score_strategy: SupportTopKScore,
+    rng: random.Random,
 ):
     pair_by_shape_word = {}
     triple_by_shape_word = {}
@@ -4859,7 +5119,14 @@ def collect_short_word_template_supports(
                     continue
                 token_shape = tuple(sorted((left["token"], right["token"])))
                 support = template_support(word_idx, (left, right))
-                keep_best_support_for_word(pair_by_shape_word, token_shape, word_idx, support)
+                keep_best_support_for_word(
+                    pair_by_shape_word,
+                    token_shape,
+                    word_idx,
+                    support,
+                    support_score_strategy=support_score_strategy,
+                    rng=rng,
+                )
         if not need_triples or len(edges) < 3:
             continue
         for first_idx, first in enumerate(edges):
@@ -4877,10 +5144,27 @@ def collect_short_word_template_supports(
                         continue
                     token_shape = tuple(sorted((first["token"], second["token"], third["token"])))
                     support = template_support(word_idx, (first, second, third))
-                    keep_best_support_for_word(triple_by_shape_word, token_shape, word_idx, support)
+                    keep_best_support_for_word(
+                        triple_by_shape_word,
+                        token_shape,
+                        word_idx,
+                        support,
+                        support_score_strategy=support_score_strategy,
+                        rng=rng,
+                    )
 
-    pair_supports = finalize_template_supports(pair_by_shape_word, top_supports_per_shape)
-    triple_supports = finalize_template_supports(triple_by_shape_word, top_supports_per_shape)
+    pair_supports = finalize_template_supports(
+        pair_by_shape_word,
+        top_supports_per_shape,
+        support_score_strategy=support_score_strategy,
+        rng=rng,
+    )
+    triple_supports = finalize_template_supports(
+        triple_by_shape_word,
+        top_supports_per_shape,
+        support_score_strategy=support_score_strategy,
+        rng=rng,
+    )
     return pair_supports, triple_supports, skipped
 
 
@@ -4897,20 +5181,49 @@ def template_support(word_idx: int, edges):
     }
 
 
-def keep_best_support_for_word(by_shape_word, token_shape, word_idx, support):
+def keep_best_support_for_word(
+    by_shape_word,
+    token_shape,
+    word_idx,
+    support,
+    *,
+    support_score_strategy: SupportTopKScore = "support_value",
+    rng: random.Random | None = None,
+):
+    validate_topk_score_strategy(support_score_strategy, "support_value")
+    rng = rng or random.Random(0)
     key = (token_shape, int(word_idx))
+    if support_score_strategy == "random":
+        support = dict(support)
+        support["_selection_score"] = rng.random()
+        score_key = "_selection_score"
+    else:
+        score_key = "value"
     previous = by_shape_word.get(key)
-    if previous is None or support["value"] > previous["value"]:
+    if previous is None or support[score_key] > previous.get(score_key, float("-inf")):
         by_shape_word[key] = support
 
 
-def finalize_template_supports(by_shape_word, top_supports_per_shape: int):
+def finalize_template_supports(
+    by_shape_word,
+    top_supports_per_shape: int,
+    *,
+    support_score_strategy: SupportTopKScore = "support_value",
+    rng: random.Random | None = None,
+):
     by_shape = defaultdict(list)
     for token_shape, _word_idx in by_shape_word:
         by_shape[token_shape].append(by_shape_word[(token_shape, _word_idx)])
     limit = max(1, int(top_supports_per_shape))
     return {
-        token_shape: sorted(supports, key=lambda row: row["value"], reverse=True)[:limit]
+        token_shape: select_topk_by_score(
+            supports,
+            limit,
+            score_strategy=support_score_strategy,
+            current_strategy="support_value",
+            current_key=lambda row: row["value"],
+            rng=rng,
+        )
         for token_shape, supports in by_shape.items()
     }
 
@@ -4927,14 +5240,15 @@ def separate_triangle_template_cuts(
     tolerance,
     max_template_cuts,
     validate_templates,
+    cut_score_strategy: CutTopKScore,
+    rng: random.Random,
 ):
     t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
     neighbors = defaultdict(set)
     for left, right in pair_supports:
         neighbors[left].add(right)
         neighbors[right].add(left)
-    heap = []
-    sequence = 0
+    selector = CutSelector(max_template_cuts, score_strategy=cut_score_strategy, rng=rng)
     candidates = 0
     invalid = 0
     emitted = set()
@@ -4962,7 +5276,7 @@ def separate_triangle_template_cuts(
                             violation = edge_sum - token_sum - 1.0
                             if violation <= tolerance:
                                 continue
-                            if max_template_cuts > 0 and len(heap) >= max_template_cuts and violation <= heap[0][0]:
+                            if selector.full_with_threshold(violation):
                                 continue
                             coefficient_key = (token_shape, tuple(sorted(columns)))
                             if coefficient_key in emitted:
@@ -4987,18 +5301,8 @@ def separate_triangle_template_cuts(
                             entries = [(col_idx, 1.0) for col_idx in columns]
                             entries.extend((t_offset + token_idx, -1.0) for token_idx in token_shape)
                             cut = (float(violation), full_key, entries, 1.0)
-                            if max_template_cuts > 0:
-                                if len(heap) < max_template_cuts:
-                                    heapq.heappush(heap, (float(violation), sequence, cut))
-                                    sequence += 1
-                                else:
-                                    heapq.heapreplace(heap, (float(violation), sequence, cut))
-                                    sequence += 1
-                            else:
-                                heap.append((float(violation), sequence, cut))
-                                sequence += 1
-    violations = [row[2] for row in sorted(heap, key=lambda item: item[0], reverse=True)]
-    return violations, candidates, invalid
+                            selector.add(float(violation), cut)
+    return selector.cuts(), candidates, invalid
 
 
 def separate_4cycle_template_cuts(
@@ -5014,10 +5318,11 @@ def separate_4cycle_template_cuts(
     tolerance,
     max_template_cuts,
     validate_templates,
+    cut_score_strategy: CutTopKScore,
+    rng: random.Random,
 ):
     t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
-    heap = []
-    sequence = 0
+    selector = CutSelector(max_template_cuts, score_strategy=cut_score_strategy, rng=rng)
     candidates = 0
     invalid = 0
     emitted = set()
@@ -5052,7 +5357,7 @@ def separate_4cycle_template_cuts(
                         violation = edge_sum - token_sum - 1.0
                         if violation <= tolerance:
                             continue
-                        if max_template_cuts > 0 and len(heap) >= max_template_cuts and violation <= heap[0][0]:
+                        if selector.full_with_threshold(violation):
                             continue
                         coefficient_key = (left_shape, right_shape, pair_shape, tuple(sorted(columns)))
                         if coefficient_key in emitted:
@@ -5077,18 +5382,173 @@ def separate_4cycle_template_cuts(
                         entries = [(col_idx, 1.0) for col_idx in columns]
                         entries.extend((t_offset + token_idx, -1.0) for token_idx in union_shape)
                         cut = (float(violation), full_key, entries, 1.0)
-                        if max_template_cuts > 0:
-                            if len(heap) < max_template_cuts:
-                                heapq.heappush(heap, (float(violation), sequence, cut))
-                                sequence += 1
-                            else:
-                                heapq.heapreplace(heap, (float(violation), sequence, cut))
-                                sequence += 1
-                        else:
-                            heap.append((float(violation), sequence, cut))
-                            sequence += 1
-    violations = [row[2] for row in sorted(heap, key=lambda item: item[0], reverse=True)]
+                        selector.add(float(violation), cut)
+    return selector.cuts(), candidates, invalid
+
+
+def separate_5cycle_template_cuts(
+    lp,
+    f_values,
+    t_values,
+    pair_supports,
+    *,
+    max_paths,
+    existing_cut_keys,
+    family_name,
+    tolerance,
+    max_template_cuts,
+    validate_templates,
+    support_limit_per_edge: int,
+    support_assignment_sample: int,
+    cut_score_strategy: CutTopKScore,
+    rng: random.Random,
+):
+    t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
+    neighbors = defaultdict(set)
+    for left, right in pair_supports:
+        neighbors[left].add(right)
+        neighbors[right].add(left)
+
+    selector = CutSelector(max_template_cuts, score_strategy=cut_score_strategy, rng=rng)
+    candidates = 0
+    invalid = 0
+    emitted = set()
+    path_pattern_cache = {}
+    paths_by_word = {}
+    cycles = enumerate_token_5cycles(neighbors)
+    support_limit = max(1, int(support_limit_per_edge))
+    for cycle in cycles:
+        edge_shapes = [tuple(sorted((cycle[idx], cycle[(idx + 1) % 5]))) for idx in range(5)]
+        support_options = [pair_supports.get(shape, ())[:support_limit] for shape in edge_shapes]
+        if any(not options for options in support_options):
+            continue
+        token_shape = tuple(sorted(cycle))
+        token_sum = sum(float(t_values[token_idx]) for token_idx in token_shape)
+        for support_indices in five_cycle_support_index_tuples(
+            support_options,
+            sample_limit=support_assignment_sample,
+            rng=rng,
+        ):
+            supports = tuple(options[index] for options, index in zip(support_options, support_indices))
+            words = tuple(int(support["word"]) for support in supports)
+            if len(set(words)) < 5:
+                continue
+            candidates += 1
+            columns = tuple(col_idx for support in supports for col_idx in support["columns"])
+            edge_sum = float(f_values[list(columns)].sum())
+            rhs_value = 2.0
+            violation = edge_sum - token_sum - rhs_value
+            if violation <= tolerance:
+                continue
+            if selector.full_with_threshold(violation):
+                continue
+            coefficient_key = (cycle, tuple(sorted(words)), tuple(sorted(columns)))
+            if coefficient_key in emitted:
+                continue
+            full_key = (family_name, token_shape, tuple(sorted(words)), coefficient_key)
+            if full_key in existing_cut_keys:
+                continue
+            if validate_templates:
+                edge_coefficients = {int(col_idx): 1.0 for col_idx in columns}
+                token_coefficients = {int(token_idx): -1.0 for token_idx in token_shape}
+                max_lhs = template_cut_max_lhs(
+                    lp,
+                    words,
+                    token_shape,
+                    edge_coefficients,
+                    token_coefficients,
+                    max_paths=max_paths,
+                    path_pattern_cache=path_pattern_cache,
+                    paths_by_word=paths_by_word,
+                )
+                if max_lhs is None or max_lhs - rhs_value > 1e-7:
+                    invalid += 1
+                    continue
+            emitted.add(coefficient_key)
+            entries = [(col_idx, 1.0) for col_idx in columns]
+            entries.extend((t_offset + token_idx, -1.0) for token_idx in token_shape)
+            cut = (float(violation), full_key, entries, rhs_value)
+            selector.add(float(violation), cut)
+    violations = selector.cuts()
+    LOGGER.info(
+        "%s: enumerated_5cycles=%d support_limit_per_edge=%d",
+        family_name,
+        len(cycles),
+        support_limit,
+    )
     return violations, candidates, invalid
+
+
+def enumerate_token_5cycles(neighbors):
+    seen = set()
+    cycles = []
+    for first in sorted(neighbors):
+        for second in sorted(neighbors[first]):
+            if second == first:
+                continue
+            for third in sorted(neighbors[second]):
+                if third in (first, second):
+                    continue
+                for fourth in sorted(neighbors[third]):
+                    if fourth in (first, second, third):
+                        continue
+                    for fifth in sorted(neighbors[fourth]):
+                        if fifth in (first, second, third, fourth):
+                            continue
+                        if first not in neighbors[fifth]:
+                            continue
+                        cycle = canonical_cycle((first, second, third, fourth, fifth))
+                        if cycle in seen:
+                            continue
+                        seen.add(cycle)
+                        cycles.append(cycle)
+    cycles.sort()
+    return cycles
+
+
+def canonical_cycle(cycle):
+    cycle = tuple(cycle)
+    rotations = []
+    for row in (cycle, tuple(reversed(cycle))):
+        for idx in range(len(row)):
+            rotations.append(row[idx:] + row[:idx])
+    return min(rotations)
+
+
+def five_cycle_support_index_tuples(support_options, *, sample_limit: int, rng: random.Random):
+    # Always include the old deterministic neighborhood of the best assignment, then
+    # optionally sample broader combinations without expanding the full Cartesian product.
+    sample_limit = int(sample_limit)
+    target = sample_limit if sample_limit > 0 else None
+    emitted = set()
+    deterministic_rows = [(0, 0, 0, 0, 0)]
+    for edge_idx, options in enumerate(support_options):
+        for support_idx in range(1, len(options)):
+            row = [0, 0, 0, 0, 0]
+            row[edge_idx] = support_idx
+            deterministic_rows.append(tuple(row))
+    for row in deterministic_rows:
+        if target is not None and len(emitted) >= target:
+            return
+        if row in emitted:
+            continue
+        emitted.add(row)
+        yield row
+    if target is None:
+        return
+    total = 1
+    for options in support_options:
+        total *= max(1, len(options))
+    target = min(sample_limit, total)
+    attempts = 0
+    max_attempts = max(100, target * 20)
+    while len(emitted) < target and attempts < max_attempts:
+        attempts += 1
+        row = tuple(rng.randrange(len(options)) for options in support_options)
+        if row in emitted:
+            continue
+        emitted.add(row)
+        yield row
 
 
 def validate_template_cut(

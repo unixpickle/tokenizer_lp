@@ -4,11 +4,12 @@ import argparse
 import json
 import logging
 from pathlib import Path
+from typing import cast
 
 from tokenisation_lp.bpe_training import train_bpe_tokenizer
 from tokenisation_lp.corpus import load_texts
 from tokenisation_lp.evaluation import evaluate_texts
-from tokenisation_lp.lp_training import CutSeparationConfig, train_lp_tokenizer
+from tokenisation_lp.lp_training import CutSeparationConfig, CutTopKScore, SupportTopKScore, WordTopKScore, train_lp_tokenizer
 from tokenisation_lp.pretokenization import DEFAULT_SPECIAL_TOKENS, DEFAULT_UNK_TOKEN
 
 
@@ -265,7 +266,7 @@ def parse_args() -> argparse.Namespace:
             "threshold_value,group_budget_value,word_hull,short_word_hull,short_word_full_hull,"
             "short_word_pair_hull,short_word_pair_single_chain,short_word_pair_bridge_chain,"
             "short_word_pair_chains,short_word_triple_hull,short_word_triple_triangle,"
-            "short_word_triple_4cycle,group_value_deep,"
+            "short_word_triple_4cycle,short_word_5cycle,group_value_deep,"
             "conflict_clique,conflict_odd_cycle,word_support,bad_vocab_escape,"
             "bad_vocab_improvement,window_overlap,window_overlap_deep,word_path_cover,window_pair."
         ),
@@ -499,6 +500,30 @@ def parse_args() -> argparse.Namespace:
         help="Maximum validated pair chain template cuts retained per family before global cut selection.",
     )
     parser.add_argument(
+        "--lp-short-word-pair-template-word-score",
+        choices=("weighted_fractionality", "random"),
+        default="weighted_fractionality",
+        help="Score used before taking the direct pair template word pool.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-support-score",
+        choices=("support_value", "random"),
+        default="support_value",
+        help="Score used before taking per-shape direct pair template supports.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-cut-score",
+        choices=("violation", "random"),
+        default="violation",
+        help="Score used before taking retained direct pair template cuts.",
+    )
+    parser.add_argument(
+        "--lp-short-word-pair-template-random-seed",
+        type=int,
+        default=0,
+        help="Random seed for direct pair template random score strategies.",
+    )
+    parser.add_argument(
         "--lp-short-word-triple-hull-max-words",
         type=int,
         default=700,
@@ -612,6 +637,57 @@ def parse_args() -> argparse.Namespace:
         help="Validate standard triplet template cuts by enumerating projected path signatures; expensive.",
     )
     parser.add_argument(
+        "--lp-short-word-5cycle-supports-per-edge",
+        type=int,
+        default=4,
+        help="Number of per-token-pair supports considered on each edge of a direct 5-cycle template.",
+    )
+    parser.add_argument(
+        "--lp-short-word-5cycle-support-assignments",
+        type=int,
+        default=0,
+        help=(
+            "Randomized support assignments checked per 5-cycle, including the default best/single-substitution "
+            "assignments. Use 0 for only the default deterministic neighborhood."
+        ),
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-word-score",
+        choices=("weighted_fractionality", "random"),
+        default="weighted_fractionality",
+        help="Score used before taking the direct triplet/5-cycle template word pool.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-support-score",
+        choices=("support_value", "random"),
+        default="support_value",
+        help="Score used before taking per-shape direct triplet/5-cycle template supports.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-cut-score",
+        choices=("violation", "random"),
+        default="violation",
+        help="Score used before taking retained direct triplet/5-cycle template cuts.",
+    )
+    parser.add_argument(
+        "--lp-short-word-triple-template-random-seed",
+        type=int,
+        default=0,
+        help="Random seed for direct triplet/5-cycle template random score strategies.",
+    )
+    parser.add_argument(
+        "--lp-cut-selection-score",
+        choices=("violation", "random"),
+        default="violation",
+        help="Score used before taking per-family and per-round cut limits.",
+    )
+    parser.add_argument(
+        "--lp-cut-selection-random-seed",
+        type=int,
+        default=0,
+        help="Random seed for random per-family and per-round cut selection.",
+    )
+    parser.add_argument(
         "--lp-run-all-cut-families",
         action="store_true",
         help="Run every requested cut family even when an earlier hull family found cuts.",
@@ -671,6 +747,10 @@ def main() -> None:
         short_word_pair_template_top_supports_per_shape=args.lp_short_word_pair_template_top_supports_per_shape,
         short_word_pair_template_max_chain_edges=args.lp_short_word_pair_template_max_chain_edges,
         short_word_pair_template_max_cuts=args.lp_short_word_pair_template_max_cuts,
+        short_word_pair_template_word_score=cast(WordTopKScore, args.lp_short_word_pair_template_word_score),
+        short_word_pair_template_support_score=cast(SupportTopKScore, args.lp_short_word_pair_template_support_score),
+        short_word_pair_template_cut_score=cast(CutTopKScore, args.lp_short_word_pair_template_cut_score),
+        short_word_pair_template_random_seed=args.lp_short_word_pair_template_random_seed,
         short_word_triple_hull_max_words=args.lp_short_word_triple_hull_max_words,
         short_word_triple_hull_max_length=args.lp_short_word_triple_hull_max_length,
         short_word_triple_hull_max_rows=args.lp_short_word_triple_hull_max_rows,
@@ -690,6 +770,14 @@ def main() -> None:
         short_word_triple_template_top_supports_per_shape=args.lp_short_word_triple_template_top_supports_per_shape,
         short_word_triple_template_max_cuts=args.lp_short_word_triple_template_max_cuts,
         short_word_triple_template_validate=args.lp_short_word_triple_template_validate,
+        short_word_5cycle_supports_per_edge=args.lp_short_word_5cycle_supports_per_edge,
+        short_word_5cycle_support_assignments=args.lp_short_word_5cycle_support_assignments,
+        short_word_triple_template_word_score=cast(WordTopKScore, args.lp_short_word_triple_template_word_score),
+        short_word_triple_template_support_score=cast(SupportTopKScore, args.lp_short_word_triple_template_support_score),
+        short_word_triple_template_cut_score=cast(CutTopKScore, args.lp_short_word_triple_template_cut_score),
+        short_word_triple_template_random_seed=args.lp_short_word_triple_template_random_seed,
+        cut_selection_score=cast(CutTopKScore, args.lp_cut_selection_score),
+        cut_selection_random_seed=args.lp_cut_selection_random_seed,
         run_all_cut_families=args.lp_run_all_cut_families,
     )
 
