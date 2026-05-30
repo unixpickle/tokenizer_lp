@@ -34,6 +34,8 @@ tokenizer-lp-triple-cut-diagnostics = "tokenisation_lp.triple_cut_diagnostics:ma
 tokenizer-lp-pair-cut-templates = "tokenisation_lp.pair_cut_template_diagnostics:main"
 tokenizer-lp-higher-order-cuts = "tokenisation_lp.higher_order_cut_diagnostics:main"
 tokenizer-lp-cma-rounding = "tokenisation_lp.cma_rounding_search:main"
+tokenizer-lp-3opt-rounding = "tokenisation_lp.three_opt_rounding_search:main"
+tokenizer-lp-3opt-export = "tokenisation_lp.three_opt_rounding_export:main"
 
 [build-system]
 requires = ["hatchling"]

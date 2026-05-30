@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+/tokenizer-lp-3opt-go
 
 # Local/generated training artifacts.
 tokenizer_runs/
@@ -19,4 +20,3 @@ tokenisation_lp/word_freqs*.npy
 tokenisation_lp/unique*.npy
 tokenisation_lp/tokenized_dataset/
 tokenisation_lp/downloaded_parquet_samples/
-
