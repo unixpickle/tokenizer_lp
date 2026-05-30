@@ -103,10 +103,12 @@ class CutSeparationConfig:
     short_word_triple_template_validate: bool = False
     short_word_5cycle_supports_per_edge: int = 4
     short_word_5cycle_support_assignments: int = 0
+    short_word_5cycle_min_distinct_words: int = 5
     short_word_triple_template_word_score: WordTopKScore = "weighted_fractionality"
     short_word_triple_template_support_score: SupportTopKScore = "support_value"
     short_word_triple_template_cut_score: CutTopKScore = "violation"
     short_word_triple_template_random_seed: int = 0
+    cut_max_per_token_set: int = 0
     cut_selection_score: CutTopKScore = "violation"
     cut_selection_random_seed: int = 0
     run_all_cut_families: bool = False
@@ -139,6 +141,16 @@ class LpSolveIteration:
     candidates: list[possibleToken]
 
 
+@dataclass(frozen=True)
+class HighsOptions:
+    solver: str = "simplex"
+    simplex_strategy: int = 1
+    presolve: str = "on"
+    threads: int = 0
+    parallel: str = "on"
+    load_basis: bool = True
+
+
 def train_lp_tokenizer(
     texts: list[str],
     vocab_size: int,
@@ -156,6 +168,7 @@ def train_lp_tokenizer(
     cut_config: CutSeparationConfig | None = None,
     lp_solution_cache_dir: str | Path | None = None,
     lp_solver: str = "highspy",
+    highs_options: HighsOptions | None = None,
     resume: bool = True,
     iteration_callback: Callable[[LpSolveIteration, LpDpTokenizer], None] | None = None,
 ) -> LpTrainingResult:
@@ -201,6 +214,7 @@ def train_lp_tokenizer(
         cut_config=cut_config,
         lp_solution_cache_dir=lp_solution_cache_dir,
         lp_solver=lp_solver,
+        highs_options=highs_options,
         resume_state_dir=(Path(output_dir) / "training_state") if output_dir is not None and resume else None,
         iteration_callback=handle_iteration,
     )
@@ -256,6 +270,7 @@ def solve_lp_vocabulary(
     cut_config: CutSeparationConfig | None = None,
     lp_solution_cache_dir: str | Path | None = None,
     lp_solver: str = "highspy",
+    highs_options: HighsOptions | None = None,
     resume_state_dir: str | Path | None = None,
     iteration_callback: Callable[[LpSolveIteration], None] | None = None,
 ) -> CandidateList:
@@ -343,6 +358,7 @@ def solve_lp_vocabulary(
             )
     highs_solver = None
     if lp_solver == "highspy":
+        highs_options = highs_options or HighsOptions()
         highs_solver = HighsWarmLpSolver(
             c=lp["c"],
             A_ub=a_ub,
@@ -352,7 +368,12 @@ def solve_lp_vocabulary(
             lb=lp["lb"],
             ub=lp["ub"],
             cache_dir=lp_solution_cache_dir,
-            basis_path=highs_basis_path,
+            basis_path=highs_basis_path if highs_options.load_basis else None,
+            highs_solver=highs_options.solver,
+            highs_simplex_strategy=highs_options.simplex_strategy,
+            highs_presolve=highs_options.presolve,
+            highs_threads=highs_options.threads,
+            highs_parallel=highs_options.parallel,
         )
     elif lp_solver != "scipy":
         raise ValueError(f"Unsupported LP solver {lp_solver!r}. Expected 'highspy' or 'scipy'.")
@@ -885,6 +906,9 @@ class HighsWarmLpSolver:
         ub,
         cache_dir=None,
         basis_path: str | Path | None = None,
+        highs_solver: str = "simplex",
+        highs_simplex_strategy: int = 1,
+        highs_presolve: str = "on",
         highs_threads: int = 0,
         highs_parallel: str = "on",
     ):
@@ -904,15 +928,24 @@ class HighsWarmLpSolver:
 
         self.highs = highspy.Highs()
         self.highs.setOptionValue("output_flag", False)
-        self.highs.setOptionValue("solver", "simplex")
-        self.highs.setOptionValue("simplex_strategy", 1)
+        self.highs.setOptionValue("solver", highs_solver)
+        self.highs.setOptionValue("simplex_strategy", int(highs_simplex_strategy))
         try:
             self.highs.resetGlobalScheduler(True)
         except RuntimeError:
             self.highs.resetGlobalScheduler(False)
         self.highs.setOptionValue("threads", int(highs_threads))
         self.highs.setOptionValue("parallel", highs_parallel)
-        self.highs.setOptionValue("presolve", "on")
+        self.highs.setOptionValue("presolve", highs_presolve)
+        LOGGER.info(
+            "Configured HiGHS: solver=%s simplex_strategy=%s presolve=%s threads=%s parallel=%s load_basis=%s",
+            highs_solver,
+            highs_simplex_strategy,
+            highs_presolve,
+            highs_threads,
+            highs_parallel,
+            self.basis_path is not None,
+        )
         self.highs.passModel(self._build_model())
         self.has_basis = False
         self._load_basis()
@@ -1330,6 +1363,7 @@ def separate_cuts(
         )
     short_word_full_hull_violations = []
     if "short_word_full_hull" in family_set:
+        print('start short_word_full_hull')
         short_word_full_hull_violations = separate_short_word_full_hull_cut_specs(
             lp,
             f_values,
@@ -1484,6 +1518,7 @@ def separate_cuts(
                 validate_templates=config.short_word_triple_template_validate,
                 five_cycle_supports_per_edge=config.short_word_5cycle_supports_per_edge,
                 five_cycle_support_assignments=config.short_word_5cycle_support_assignments,
+                five_cycle_min_distinct_words=config.short_word_5cycle_min_distinct_words,
                 word_score_strategy=config.short_word_triple_template_word_score,
                 support_score_strategy=config.short_word_triple_template_support_score,
                 cut_score_strategy=config.short_word_triple_template_cut_score,
@@ -1508,6 +1543,7 @@ def separate_cuts(
                 validate_templates=config.short_word_triple_template_validate,
                 five_cycle_supports_per_edge=config.short_word_5cycle_supports_per_edge,
                 five_cycle_support_assignments=config.short_word_5cycle_support_assignments,
+                five_cycle_min_distinct_words=config.short_word_5cycle_min_distinct_words,
                 word_score_strategy=config.short_word_triple_template_word_score,
                 support_score_strategy=config.short_word_triple_template_support_score,
                 cut_score_strategy=config.short_word_triple_template_cut_score,
@@ -1532,6 +1568,7 @@ def separate_cuts(
                 validate_templates=config.short_word_triple_template_validate,
                 five_cycle_supports_per_edge=config.short_word_5cycle_supports_per_edge,
                 five_cycle_support_assignments=config.short_word_5cycle_support_assignments,
+                five_cycle_min_distinct_words=config.short_word_5cycle_min_distinct_words,
                 word_score_strategy=config.short_word_triple_template_word_score,
                 support_score_strategy=config.short_word_triple_template_support_score,
                 cut_score_strategy=config.short_word_triple_template_cut_score,
@@ -1657,6 +1694,17 @@ def separate_cuts(
     if not violations:
         return None, np.array([], dtype=float), [], 0.0
 
+    t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
+    violations = limit_cuts_per_token_set(
+        violations,
+        max_per_token_set=config.cut_max_per_token_set,
+        t_offset=t_offset,
+        score_strategy=config.cut_selection_score,
+        rng=cut_selection_rng,
+    )
+    if not violations:
+        return None, np.array([], dtype=float), [], 0.0
+
     selected = select_topk_by_score(
         violations,
         max_cuts,
@@ -1690,6 +1738,82 @@ def separate_cuts(
         [key for _, key, _, _ in selected],
         float(selected[0][0]),
     )
+
+
+def limit_cuts_per_token_set(
+    cuts,
+    *,
+    max_per_token_set: int,
+    t_offset: int,
+    score_strategy: CutTopKScore,
+    rng: random.Random,
+):
+    limit = int(max_per_token_set)
+    if limit <= 0:
+        return list(cuts)
+
+    by_token_set = defaultdict(list)
+    for cut in cuts:
+        by_token_set[cut_token_set_from_entries(cut[2], t_offset)].append(cut)
+
+    limited = []
+    suppressed = 0
+    capped_sets = 0
+    largest_group = 0
+    for token_set, rows in by_token_set.items():
+        largest_group = max(largest_group, len(rows))
+        if len(rows) > limit:
+            capped_sets += 1
+            suppressed += len(rows) - limit
+            rows = select_topk_by_score(
+                rows,
+                limit,
+                score_strategy=score_strategy,
+                current_strategy="violation",
+                current_key=lambda item: item[0],
+                rng=rng,
+            )
+        limited.extend(rows)
+
+    if suppressed:
+        LOGGER.info(
+            "Limited cuts per token set: before=%d after=%d max_per_token_set=%d "
+            "token_sets=%d capped_sets=%d largest_group=%d suppressed=%d score=%s",
+            len(cuts),
+            len(limited),
+            limit,
+            len(by_token_set),
+            capped_sets,
+            largest_group,
+            suppressed,
+            score_strategy,
+        )
+    return limited
+
+
+def cut_token_set_from_entries(entries, t_offset: int) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            {
+                int(col_idx) - int(t_offset)
+                for col_idx, _coefficient in entries
+                if int(col_idx) >= int(t_offset)
+            }
+        )
+    )
+
+
+def cut_row_hash(entries, rhs: float) -> bytes:
+    coefficients = defaultdict(float)
+    for col_idx, coefficient in entries:
+        coefficients[int(col_idx)] += float(coefficient)
+    items = tuple(
+        (col_idx, round(coefficient, 12))
+        for col_idx, coefficient in sorted(coefficients.items())
+        if abs(coefficient) > 1e-12
+    )
+    payload = repr((items, round(float(rhs), 12))).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=16).digest()
 
 
 class PerFamilyCutList(list):
@@ -4054,6 +4178,18 @@ def separate_short_word_pair_hull_cut_specs(
     cache_cut_hits = 0
     cache_no_cut_hits = 0
     cache_full_skips = 0
+    duplicate_rows = 0
+    emitted_row_hashes = set()
+
+    def add_pair_hull_cut(cut) -> bool:
+        nonlocal duplicate_rows
+        row_hash = cut_row_hash(cut[2], cut[3])
+        if row_hash in emitted_row_hashes:
+            duplicate_rows += 1
+            return False
+        emitted_row_hashes.add(row_hash)
+        violations.append(cut)
+        return True
 
     solution_cache = solution_cache if solution_cache is not None and solution_cache_max_entries > 0 else None
     existing_pair_prefixes = {
@@ -4116,7 +4252,7 @@ def separate_short_word_pair_hull_cut_specs(
                     )
                     if current_violation > tolerance and cut[1] not in existing_cut_keys:
                         cache_cut_hits += 1
-                        violations.append((current_violation, cut[1], cut[2], cut[3]))
+                        add_pair_hull_cut((current_violation, cut[1], cut[2], cut[3]))
                 continue
             if len(solution_cache) >= solution_cache_max_entries:
                 cache_full_skips += 1
@@ -4186,6 +4322,8 @@ def separate_short_word_pair_hull_cut_specs(
     solve_seconds = 0.0
     validation_seconds = 0.0
     worker_reduced_row_skips = 0
+    duplicate_rows = 0
+    emitted_row_hashes = set()
     reduced_rows = []
     edge_vars = []
     progress_interval = max(1, int(math.ceil(len(tasks) / 40)))
@@ -4237,7 +4375,7 @@ def separate_short_word_pair_hull_cut_specs(
             )
             cut = result["cut"]
             if cut is not None:
-                violations.append(cut)
+                add_pair_hull_cut(cut)
             log_pair_hull_progress()
     else:
         context = mp.get_context("fork") if hasattr(os, "fork") else None
@@ -4271,7 +4409,7 @@ def separate_short_word_pair_hull_cut_specs(
                     )
                     cut = result["cut"]
                     if cut is not None:
-                        violations.append(cut)
+                        add_pair_hull_cut(cut)
                 log_pair_hull_progress()
 
     elapsed = time.monotonic() - start_time
@@ -4281,7 +4419,8 @@ def separate_short_word_pair_hull_cut_specs(
         "batches=%d batch_size=%d wall=%.3fs worker_build=%.3fs worker_solve=%.3fs "
         "worker_validate=%.3fs skipped_colors=%d skipped_shared=%d skipped_paths=%d skipped_rows=%d "
         "worker_row_skips=%d cache_hits=%d cached_cuts=%d cached_no_cuts=%d cache_size=%d "
-        "cache_full_skips=%d cache_value_quantum=%.6g patterns=%d reduced_rows=%s edge_vars=%s",
+        "cache_full_skips=%d cache_value_quantum=%.6g duplicate_rows=%d patterns=%d "
+        "reduced_rows=%s edge_vars=%s",
         len(pair_rows),
         candidate_max_words,
         candidate_top_words_per_color,
@@ -4309,6 +4448,7 @@ def separate_short_word_pair_hull_cut_specs(
         len(solution_cache) if solution_cache is not None else 0,
         cache_full_skips,
         solution_cache_value_quantum,
+        duplicate_rows,
         len(path_pattern_cache),
         small_quantile_summary(reduced_rows),
         small_quantile_summary(edge_vars),
@@ -4361,10 +4501,45 @@ def separate_short_word_triple_hull_cut_specs(
     )
     word_colors = {}
     color_to_words = defaultdict(list)
+    checked_words = 0
+    scanned_edges = 0
+    fractional_edges = 0
+    scored_colors = 0
+    word_scan_start = time.monotonic()
+    word_progress_interval = max(1, int(math.ceil(len(ranked_words) / 40))) if ranked_words else 1
+    next_word_progress = word_progress_interval
+    last_logged_words = 0
+
+    def log_word_scan_progress(force: bool = False):
+        nonlocal next_word_progress, last_logged_words
+        if not ranked_words:
+            return
+        if force and checked_words == last_logged_words:
+            return
+        if not force and checked_words < next_word_progress:
+            return
+        while next_word_progress <= checked_words:
+            next_word_progress += word_progress_interval
+        last_logged_words = checked_words
+        LOGGER.info(
+            "short_word_triple_hull word_scan progress: words=%d/%d %.1f%% "
+            "colors=%d scored_colors=%d scanned_edges=%d fractional_edges=%d wall=%.3fs",
+            checked_words,
+            len(ranked_words),
+            100.0 * checked_words / max(1, len(ranked_words)),
+            len(color_to_words),
+            scored_colors,
+            scanned_edges,
+            fractional_edges,
+            time.monotonic() - word_scan_start,
+        )
+
     for word_idx in ranked_words:
+        checked_words += 1
         scores = defaultdict(float)
         word_weight = float(lp["word_weights"][word_idx])
         for edge_idx in lp["word_nonfree_edges"].get(word_idx, []):
+            scanned_edges += 1
             edge_value = float(f_values[edge_idx])
             if not (tolerance < edge_value < 1.0 - tolerance):
                 continue
@@ -4372,10 +4547,14 @@ def separate_short_word_triple_hull_cut_specs(
             token_idx = info["token_index"]
             if token_idx not in fractional_colors:
                 continue
+            fractional_edges += 1
             scores[token_idx] += min(edge_value, 1.0 - edge_value) * max(1, info["end"] - info["start"])
         word_colors[word_idx] = set(all_word_token_colors(lp, word_idx))
         for token_idx, score in scores.items():
             color_to_words[token_idx].append((word_weight * score, word_idx))
+        scored_colors += len(scores)
+        log_word_scan_progress()
+    log_word_scan_progress(force=True)
     for rows in color_to_words.values():
         rows.sort(reverse=True)
 
@@ -4473,13 +4652,15 @@ def separate_short_word_triple_hull_cut_specs(
     solve_seconds = 0.0
     validation_seconds = 0.0
     worker_reduced_row_skips = 0
+    duplicate_rows = 0
+    emitted_row_hashes = set()
     reduced_rows = []
     edge_vars = []
     progress_interval = max(1, int(math.ceil(len(tasks) / 40)))
     next_progress = progress_interval
 
     def handle_result(result):
-        nonlocal checked, build_seconds, solve_seconds, validation_seconds, worker_reduced_row_skips
+        nonlocal checked, build_seconds, solve_seconds, validation_seconds, worker_reduced_row_skips, duplicate_rows
         if result is None:
             return
         checked += 1
@@ -4494,6 +4675,11 @@ def separate_short_word_triple_hull_cut_specs(
             edge_vars.append(result["edge_vars"])
         cut = result["cut"]
         if cut is not None:
+            row_hash = cut_row_hash(cut[2], cut[3])
+            if row_hash in emitted_row_hashes:
+                duplicate_rows += 1
+                return
+            emitted_row_hashes.add(row_hash)
             violations.append(cut)
 
     def log_triple_hull_progress():
@@ -4543,7 +4729,8 @@ def separate_short_word_triple_hull_cut_specs(
         "short_word_triple_hull: candidates_sampled=%d estimated_candidates=%d candidate_words=%d "
         "candidate_top_words=%d candidate_seed=%d token_mode=%s tasks=%d checked=%d cuts=%d "
         "workers=%d batches=%d batch_size=%d wall=%.3fs worker_build=%.3fs worker_solve=%.3fs "
-        "worker_validate=%.3fs skipped=%s worker_row_skips=%d patterns=%d reduced_rows=%s edge_vars=%s",
+        "worker_validate=%.3fs skipped=%s worker_row_skips=%d duplicate_rows=%d patterns=%d "
+        "reduced_rows=%s edge_vars=%s",
         len(candidates),
         estimated_candidate_triples,
         candidate_max_words,
@@ -4562,6 +4749,7 @@ def separate_short_word_triple_hull_cut_specs(
         validation_seconds,
         dict(skipped),
         worker_reduced_row_skips,
+        duplicate_rows,
         len(path_pattern_cache),
         small_quantile_summary(reduced_rows),
         small_quantile_summary(edge_vars),
@@ -4905,27 +5093,73 @@ def separate_bridge_chain_template_cuts(
     emitted = set()
     path_pattern_cache = {}
     paths_by_word = {}
+    total_support_pairs = sum(
+        len(supports) * (len(supports) - 1) // 2
+        for selected_tokens, supports in bridge_supports.items()
+        if len(selected_tokens) == 2
+    )
+    checked_support_pairs = 0
+    rhs_seconds = 0.0
+    progress_start = time.monotonic()
+    progress_interval = max(1, int(math.ceil(total_support_pairs / 40))) if total_support_pairs else 1
+    next_progress = progress_interval
+    last_logged_support_pairs = 0
+
+    def log_bridge_progress(force: bool = False):
+        nonlocal next_progress, last_logged_support_pairs
+        if not total_support_pairs:
+            return
+        if force and checked_support_pairs == last_logged_support_pairs:
+            return
+        if not force and checked_support_pairs < next_progress:
+            return
+        while next_progress <= checked_support_pairs:
+            next_progress += progress_interval
+        last_logged_support_pairs = checked_support_pairs
+        cut_count = len(selector.heap) if selector.max_cuts > 0 else len(selector.rows)
+        LOGGER.info(
+            "%s bridge_chain progress: support_pairs=%d/%d %.1f%% candidates=%d cuts=%d "
+            "path_skips=%d emitted=%d cached_words=%d patterns=%d rhs_wall=%.3fs wall=%.3fs",
+            family_name,
+            checked_support_pairs,
+            total_support_pairs,
+            100.0 * checked_support_pairs / max(1, total_support_pairs),
+            candidates,
+            cut_count,
+            path_skips,
+            len(emitted),
+            len(paths_by_word),
+            len(path_pattern_cache),
+            rhs_seconds,
+            time.monotonic() - progress_start,
+        )
+
     for selected_tokens, supports in bridge_supports.items():
         if len(selected_tokens) != 2:
             continue
         token_sum = sum(float(t_values[token_idx]) for token_idx in selected_tokens)
         for left_idx, left_support in enumerate(supports):
             for right_support in supports[left_idx + 1 :]:
+                checked_support_pairs += 1
                 left_word = int(left_support["word"])
                 right_word = int(right_support["word"])
                 if left_word == right_word:
+                    log_bridge_progress()
                     continue
                 candidates += 1
                 words = (left_word, right_word)
                 columns = tuple(int(col_idx) for col_idx in (*left_support["columns"], *right_support["columns"]))
                 coefficient_key = (tuple(sorted(words)), tuple(int(token_idx) for token_idx in selected_tokens), tuple(sorted(columns)))
                 if coefficient_key in emitted:
+                    log_bridge_progress()
                     continue
                 full_key = (family_name, "bridge", tuple(sorted(words)), tuple(int(token_idx) for token_idx in selected_tokens), tuple(sorted(columns)))
                 if full_key in existing_cut_keys:
+                    log_bridge_progress()
                     continue
                 edge_coefficients = {col_idx: 1.0 for col_idx in columns}
                 token_coefficients = {int(token_idx): -1.0 for token_idx in selected_tokens}
+                rhs_start = time.monotonic()
                 rhs = template_cut_max_lhs(
                     lp,
                     words,
@@ -4936,17 +5170,22 @@ def separate_bridge_chain_template_cuts(
                     path_pattern_cache=path_pattern_cache,
                     paths_by_word=paths_by_word,
                 )
+                rhs_seconds += time.monotonic() - rhs_start
                 if rhs is None:
                     path_skips += 1
+                    log_bridge_progress()
                     continue
                 violation = float(sum(float(f_values[col_idx]) for col_idx in columns) - token_sum - rhs)
                 if violation <= tolerance:
+                    log_bridge_progress()
                     continue
                 emitted.add(coefficient_key)
                 entries = [(col_idx, 1.0) for col_idx in columns]
                 entries.extend((t_offset + token_idx, -1.0) for token_idx in selected_tokens)
                 cut = (float(violation), full_key, entries, float(rhs))
                 selector.add(float(violation), cut)
+                log_bridge_progress()
+    log_bridge_progress(force=True)
     return selector.cuts(), candidates, path_skips
 
 
@@ -4967,6 +5206,7 @@ def separate_short_word_triple_template_cut_specs(
     validate_templates: bool = False,
     five_cycle_supports_per_edge: int = 4,
     five_cycle_support_assignments: int = 0,
+    five_cycle_min_distinct_words: int = 5,
     word_score_strategy: WordTopKScore = "weighted_fractionality",
     support_score_strategy: SupportTopKScore = "support_value",
     cut_score_strategy: CutTopKScore = "violation",
@@ -5045,6 +5285,7 @@ def separate_short_word_triple_template_cut_specs(
             validate_templates=validate_templates,
             support_limit_per_edge=five_cycle_supports_per_edge,
             support_assignment_sample=five_cycle_support_assignments,
+            min_distinct_words=five_cycle_min_distinct_words,
             cut_score_strategy=cut_score_strategy,
             rng=rng,
         )
@@ -5052,6 +5293,7 @@ def separate_short_word_triple_template_cut_specs(
         "%s: template=%s candidate_words=%d pair_shapes=%d triple_shapes=%d candidates=%d "
         "cuts=%d invalid=%d skipped=%s top_supports_per_shape=%d max_template_cuts=%d "
         "five_cycle_supports_per_edge=%d five_cycle_support_assignments=%d "
+        "five_cycle_min_distinct_words=%d "
         "word_score=%s support_score=%s cut_score=%s validate=%s wall=%.3fs",
         family_name,
         template,
@@ -5066,6 +5308,7 @@ def separate_short_word_triple_template_cut_specs(
         max_template_cuts,
         five_cycle_supports_per_edge,
         five_cycle_support_assignments,
+        five_cycle_min_distinct_words,
         word_score_strategy,
         support_score_strategy,
         cut_score_strategy,
@@ -5400,6 +5643,7 @@ def separate_5cycle_template_cuts(
     validate_templates,
     support_limit_per_edge: int,
     support_assignment_sample: int,
+    min_distinct_words: int,
     cut_score_strategy: CutTopKScore,
     rng: random.Random,
 ):
@@ -5417,10 +5661,55 @@ def separate_5cycle_template_cuts(
     paths_by_word = {}
     cycles = enumerate_token_5cycles(neighbors)
     support_limit = max(1, int(support_limit_per_edge))
+    min_distinct = max(1, min(5, int(min_distinct_words)))
+    checked_cycles = 0
+    skipped_cycles = 0
+    support_assignments = 0
+    validation_seconds = 0.0
+    progress_start = time.monotonic()
+    progress_interval = max(1, int(math.ceil(len(cycles) / 40))) if cycles else 1
+    next_progress = progress_interval
+    last_logged_cycles = 0
+
+    def log_5cycle_progress(force: bool = False):
+        nonlocal next_progress, last_logged_cycles
+        if not cycles:
+            return
+        if force and checked_cycles == last_logged_cycles:
+            return
+        if not force and checked_cycles < next_progress:
+            return
+        while next_progress <= checked_cycles:
+            next_progress += progress_interval
+        last_logged_cycles = checked_cycles
+        cut_count = len(selector.heap) if selector.max_cuts > 0 else len(selector.rows)
+        LOGGER.info(
+            "%s 5cycle progress: cycles=%d/%d %.1f%% assignments=%d candidates=%d "
+            "cuts=%d invalid=%d skipped_cycles=%d emitted=%d cached_words=%d patterns=%d "
+            "validation_wall=%.3fs wall=%.3fs",
+            family_name,
+            checked_cycles,
+            len(cycles),
+            100.0 * checked_cycles / max(1, len(cycles)),
+            support_assignments,
+            candidates,
+            cut_count,
+            invalid,
+            skipped_cycles,
+            len(emitted),
+            len(paths_by_word),
+            len(path_pattern_cache),
+            validation_seconds,
+            time.monotonic() - progress_start,
+        )
+
     for cycle in cycles:
+        checked_cycles += 1
         edge_shapes = [tuple(sorted((cycle[idx], cycle[(idx + 1) % 5]))) for idx in range(5)]
         support_options = [pair_supports.get(shape, ())[:support_limit] for shape in edge_shapes]
         if any(not options for options in support_options):
+            skipped_cycles += 1
+            log_5cycle_progress()
             continue
         token_shape = tuple(sorted(cycle))
         token_sum = sum(float(t_values[token_idx]) for token_idx in token_shape)
@@ -5429,9 +5718,10 @@ def separate_5cycle_template_cuts(
             sample_limit=support_assignment_sample,
             rng=rng,
         ):
+            support_assignments += 1
             supports = tuple(options[index] for options, index in zip(support_options, support_indices))
             words = tuple(int(support["word"]) for support in supports)
-            if len(set(words)) < 5:
+            if len(set(words)) < min_distinct:
                 continue
             candidates += 1
             columns = tuple(col_idx for support in supports for col_idx in support["columns"])
@@ -5448,9 +5738,10 @@ def separate_5cycle_template_cuts(
             full_key = (family_name, token_shape, tuple(sorted(words)), coefficient_key)
             if full_key in existing_cut_keys:
                 continue
+            edge_coefficients = Counter(int(col_idx) for col_idx in columns)
             if validate_templates:
-                edge_coefficients = {int(col_idx): 1.0 for col_idx in columns}
                 token_coefficients = {int(token_idx): -1.0 for token_idx in token_shape}
+                validation_start = time.monotonic()
                 max_lhs = template_cut_max_lhs(
                     lp,
                     words,
@@ -5461,20 +5752,29 @@ def separate_5cycle_template_cuts(
                     path_pattern_cache=path_pattern_cache,
                     paths_by_word=paths_by_word,
                 )
+                validation_seconds += time.monotonic() - validation_start
                 if max_lhs is None or max_lhs - rhs_value > 1e-7:
                     invalid += 1
                     continue
             emitted.add(coefficient_key)
-            entries = [(col_idx, 1.0) for col_idx in columns]
+            entries = [(col_idx, float(coeff)) for col_idx, coeff in sorted(edge_coefficients.items())]
             entries.extend((t_offset + token_idx, -1.0) for token_idx in token_shape)
             cut = (float(violation), full_key, entries, rhs_value)
             selector.add(float(violation), cut)
+        log_5cycle_progress()
+    log_5cycle_progress(force=True)
     violations = selector.cuts()
     LOGGER.info(
-        "%s: enumerated_5cycles=%d support_limit_per_edge=%d",
+        "%s: enumerated_5cycles=%d checked_cycles=%d support_assignments=%d "
+        "skipped_cycles=%d validation_wall=%.3fs support_limit_per_edge=%d min_distinct_words=%d",
         family_name,
         len(cycles),
+        checked_cycles,
+        support_assignments,
+        skipped_cycles,
+        validation_seconds,
         support_limit,
+        min_distinct,
     )
     return violations, candidates, invalid
 
@@ -5609,6 +5909,7 @@ def template_cut_max_lhs(
     path_pattern_cache,
     paths_by_word,
 ):
+    word_indices = tuple(dict.fromkeys(int(word_idx) for word_idx in word_indices))
     selected_tokens = tuple(int(token_idx) for token_idx in selected_tokens)
     selected_position = {token_idx: idx for idx, token_idx in enumerate(selected_tokens)}
     selected_set = set(selected_tokens)

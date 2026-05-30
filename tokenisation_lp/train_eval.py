@@ -9,7 +9,14 @@ from typing import cast
 from tokenisation_lp.bpe_training import train_bpe_tokenizer
 from tokenisation_lp.corpus import load_texts
 from tokenisation_lp.evaluation import evaluate_texts
-from tokenisation_lp.lp_training import CutSeparationConfig, CutTopKScore, SupportTopKScore, WordTopKScore, train_lp_tokenizer
+from tokenisation_lp.lp_training import (
+    CutSeparationConfig,
+    CutTopKScore,
+    HighsOptions,
+    SupportTopKScore,
+    WordTopKScore,
+    train_lp_tokenizer,
+)
 from tokenisation_lp.pretokenization import DEFAULT_SPECIAL_TOKENS, DEFAULT_UNK_TOKEN
 
 
@@ -33,6 +40,7 @@ def train_and_eval_lp(
     cut_config: CutSeparationConfig,
     lp_solution_cache_dir: str | None,
     lp_solver: str,
+    highs_options: HighsOptions | None,
     resume: bool,
 ):
     saw_iteration = False
@@ -138,6 +146,7 @@ def train_and_eval_lp(
         cut_config=cut_config,
         lp_solution_cache_dir=lp_solution_cache_dir,
         lp_solver=lp_solver,
+        highs_options=highs_options,
         resume=resume,
         iteration_callback=on_iteration,
     )
@@ -281,6 +290,41 @@ def parse_args() -> argparse.Namespace:
         choices=("highspy", "scipy"),
         default="highspy",
         help="LP solver backend. highspy keeps a simplex model alive for iterative cut warm starts.",
+    )
+    parser.add_argument(
+        "--lp-highs-solver",
+        choices=("simplex", "ipm", "choose"),
+        default="simplex",
+        help="HiGHS solver option used by the highspy backend.",
+    )
+    parser.add_argument(
+        "--lp-highs-simplex-strategy",
+        type=int,
+        default=1,
+        help="HiGHS simplex_strategy option. Ignored by non-simplex solver choices.",
+    )
+    parser.add_argument(
+        "--lp-highs-presolve",
+        choices=("on", "off", "choose"),
+        default="on",
+        help="Initial HiGHS presolve option. Loaded bases and added rows still disable presolve for warm starts.",
+    )
+    parser.add_argument(
+        "--lp-highs-threads",
+        type=int,
+        default=0,
+        help="HiGHS thread count. 0 lets HiGHS choose.",
+    )
+    parser.add_argument(
+        "--lp-highs-parallel",
+        choices=("on", "off", "choose"),
+        default="on",
+        help="HiGHS parallel option.",
+    )
+    parser.add_argument(
+        "--lp-highs-no-load-basis",
+        action="store_true",
+        help="Do not load the saved HiGHS basis when resuming.",
     )
     parser.add_argument(
         "--no-resume",
@@ -652,6 +696,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--lp-short-word-5cycle-min-distinct-words",
+        type=int,
+        default=5,
+        help="Minimum distinct words required across the five pair supports of a direct 5-cycle template.",
+    )
+    parser.add_argument(
         "--lp-short-word-triple-template-word-score",
         choices=("weighted_fractionality", "random"),
         default="weighted_fractionality",
@@ -680,6 +730,15 @@ def parse_args() -> argparse.Namespace:
         choices=("violation", "random"),
         default="violation",
         help="Score used before taking per-family and per-round cut limits.",
+    )
+    parser.add_argument(
+        "--lp-cut-max-per-token-set",
+        type=int,
+        default=0,
+        help=(
+            "Maximum cuts retained per separation round for any one set of token variables. "
+            "Use 0 to disable this diversity cap."
+        ),
     )
     parser.add_argument(
         "--lp-cut-selection-random-seed",
@@ -772,13 +831,23 @@ def main() -> None:
         short_word_triple_template_validate=args.lp_short_word_triple_template_validate,
         short_word_5cycle_supports_per_edge=args.lp_short_word_5cycle_supports_per_edge,
         short_word_5cycle_support_assignments=args.lp_short_word_5cycle_support_assignments,
+        short_word_5cycle_min_distinct_words=args.lp_short_word_5cycle_min_distinct_words,
         short_word_triple_template_word_score=cast(WordTopKScore, args.lp_short_word_triple_template_word_score),
         short_word_triple_template_support_score=cast(SupportTopKScore, args.lp_short_word_triple_template_support_score),
         short_word_triple_template_cut_score=cast(CutTopKScore, args.lp_short_word_triple_template_cut_score),
         short_word_triple_template_random_seed=args.lp_short_word_triple_template_random_seed,
+        cut_max_per_token_set=args.lp_cut_max_per_token_set,
         cut_selection_score=cast(CutTopKScore, args.lp_cut_selection_score),
         cut_selection_random_seed=args.lp_cut_selection_random_seed,
         run_all_cut_families=args.lp_run_all_cut_families,
+    )
+    highs_options = HighsOptions(
+        solver=args.lp_highs_solver,
+        simplex_strategy=args.lp_highs_simplex_strategy,
+        presolve=args.lp_highs_presolve,
+        threads=args.lp_highs_threads,
+        parallel=args.lp_highs_parallel,
+        load_basis=not args.lp_highs_no_load_basis,
     )
 
     if args.kind in {"lp", "both"}:
@@ -798,6 +867,7 @@ def main() -> None:
             cut_config=cut_config,
             lp_solution_cache_dir=args.lp_solution_cache_dir,
             lp_solver=args.lp_solver,
+            highs_options=highs_options,
             resume=not args.no_resume,
         )
 
