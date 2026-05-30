@@ -741,6 +741,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--lp-cut-rhs-slack",
+        type=float,
+        default=0.0,
+        help=(
+            "Nonnegative slack added to every generated cut RHS. Cuts whose violation is not "
+            "larger than this slack plus lp-cut-tolerance are discarded."
+        ),
+    )
+    parser.add_argument(
         "--lp-cut-selection-random-seed",
         type=int,
         default=0,
@@ -837,6 +846,7 @@ def main() -> None:
         short_word_triple_template_cut_score=cast(CutTopKScore, args.lp_short_word_triple_template_cut_score),
         short_word_triple_template_random_seed=args.lp_short_word_triple_template_random_seed,
         cut_max_per_token_set=args.lp_cut_max_per_token_set,
+        cut_rhs_slack=args.lp_cut_rhs_slack,
         cut_selection_score=cast(CutTopKScore, args.lp_cut_selection_score),
         cut_selection_random_seed=args.lp_cut_selection_random_seed,
         run_all_cut_families=args.lp_run_all_cut_families,

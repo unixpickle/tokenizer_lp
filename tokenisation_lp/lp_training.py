@@ -109,6 +109,7 @@ class CutSeparationConfig:
     short_word_triple_template_cut_score: CutTopKScore = "violation"
     short_word_triple_template_random_seed: int = 0
     cut_max_per_token_set: int = 0
+    cut_rhs_slack: float = 0.0
     cut_selection_score: CutTopKScore = "violation"
     cut_selection_random_seed: int = 0
     run_all_cut_families: bool = False
@@ -1694,6 +1695,23 @@ def separate_cuts(
     if not violations:
         return None, np.array([], dtype=float), [], 0.0
 
+    cut_rhs_slack = max(0.0, float(config.cut_rhs_slack))
+    if cut_rhs_slack > 0.0:
+        slack_threshold = float(tolerance) + cut_rhs_slack
+        before_slack = len(violations)
+        violations = [cut for cut in violations if float(cut[0]) > slack_threshold]
+        if before_slack != len(violations):
+            LOGGER.info(
+                "Filtered cuts by RHS slack: before=%d after=%d rhs_slack=%.6g "
+                "effective_tolerance=%.6g",
+                before_slack,
+                len(violations),
+                cut_rhs_slack,
+                slack_threshold,
+            )
+        if not violations:
+            return None, np.array([], dtype=float), [], 0.0
+
     t_offset = lp["num_nonfree_edges"] + lp["num_free_edges"]
     violations = limit_cuts_per_token_set(
         violations,
@@ -1721,7 +1739,7 @@ def separate_cuts(
     rhs_values = []
 
     for row_idx, (_, _, entries, rhs) in enumerate(selected):
-        rhs_values.append(float(rhs))
+        rhs_values.append(float(rhs) + cut_rhs_slack)
         for col_idx, coefficient in entries:
             rows.append(row_idx)
             cols.append(col_idx)
@@ -1736,7 +1754,7 @@ def separate_cuts(
         cut_matrix,
         np.array(rhs_values, dtype=float),
         [key for _, key, _, _ in selected],
-        float(selected[0][0]),
+        float(selected[0][0] - cut_rhs_slack),
     )
 
 
