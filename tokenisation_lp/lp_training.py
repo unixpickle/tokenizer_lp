@@ -150,6 +150,11 @@ class HighsOptions:
     threads: int = 0
     parallel: str = "on"
     load_basis: bool = True
+    output_flag: bool = False
+    log_to_console: bool = True
+    log_file: str | None = None
+    log_dev_level: int = 0
+    analysis_level: int = 0
 
 
 def train_lp_tokenizer(
@@ -170,6 +175,8 @@ def train_lp_tokenizer(
     lp_solution_cache_dir: str | Path | None = None,
     lp_solver: str = "highspy",
     highs_options: HighsOptions | None = None,
+    objective_perturbation: float = 0.0,
+    objective_perturbation_seed: int = 0,
     resume: bool = True,
     iteration_callback: Callable[[LpSolveIteration, LpDpTokenizer], None] | None = None,
 ) -> LpTrainingResult:
@@ -216,6 +223,8 @@ def train_lp_tokenizer(
         lp_solution_cache_dir=lp_solution_cache_dir,
         lp_solver=lp_solver,
         highs_options=highs_options,
+        objective_perturbation=objective_perturbation,
+        objective_perturbation_seed=objective_perturbation_seed,
         resume_state_dir=(Path(output_dir) / "training_state") if output_dir is not None and resume else None,
         iteration_callback=handle_iteration,
     )
@@ -272,6 +281,8 @@ def solve_lp_vocabulary(
     lp_solution_cache_dir: str | Path | None = None,
     lp_solver: str = "highspy",
     highs_options: HighsOptions | None = None,
+    objective_perturbation: float = 0.0,
+    objective_perturbation_seed: int = 0,
     resume_state_dir: str | Path | None = None,
     iteration_callback: Callable[[LpSolveIteration], None] | None = None,
 ) -> CandidateList:
@@ -303,6 +314,21 @@ def solve_lp_vocabulary(
         return result
 
     lp = build_standard_form(edges_list, freqs, tokens, free_edges_list, num_vertices)
+    if not math.isfinite(float(objective_perturbation)) or objective_perturbation < 0:
+        raise ValueError("objective_perturbation must be finite and nonnegative.")
+    solver_c = perturbed_objective(
+        lp["c"],
+        magnitude=objective_perturbation,
+        seed=objective_perturbation_seed,
+    )
+    if objective_perturbation > 0:
+        perturbed_count = int(np.count_nonzero(solver_c != lp["c"]))
+        LOGGER.info(
+            "Applied conservative LP objective perturbation: magnitude=%g seed=%d perturbed_coefficients=%d",
+            objective_perturbation,
+            objective_perturbation_seed,
+            perturbed_count,
+        )
     LOGGER.info(
         "Solving LP with %d candidate tokens, %d non-free edges, %d free edges",
         lp["num_tokens"],
@@ -331,6 +357,8 @@ def solve_lp_vocabulary(
         cut_tolerance=cut_tolerance,
         cut_families=cut_families,
         cut_config=cut_config,
+        objective_perturbation=objective_perturbation,
+        objective_perturbation_seed=objective_perturbation_seed,
         lp=lp,
     )
     if state_dir is not None:
@@ -361,7 +389,7 @@ def solve_lp_vocabulary(
     if lp_solver == "highspy":
         highs_options = highs_options or HighsOptions()
         highs_solver = HighsWarmLpSolver(
-            c=lp["c"],
+            c=solver_c,
             A_ub=a_ub,
             b_ub=b_ub,
             A_eq=lp["A_eq"],
@@ -375,6 +403,11 @@ def solve_lp_vocabulary(
             highs_presolve=highs_options.presolve,
             highs_threads=highs_options.threads,
             highs_parallel=highs_options.parallel,
+            highs_output_flag=highs_options.output_flag,
+            highs_log_to_console=highs_options.log_to_console,
+            highs_log_file=highs_options.log_file,
+            highs_log_dev_level=highs_options.log_dev_level,
+            highs_analysis_level=highs_options.analysis_level,
         )
     elif lp_solver != "scipy":
         raise ValueError(f"Unsupported LP solver {lp_solver!r}. Expected 'highspy' or 'scipy'.")
@@ -385,7 +418,7 @@ def solve_lp_vocabulary(
             solution = highs_solver.solve()
         else:
             solution = solve_linprog_cached(
-                c=lp["c"],
+                c=solver_c,
                 A_ub=a_ub,
                 b_ub=b_ub,
                 A_eq=lp["A_eq"],
@@ -398,6 +431,7 @@ def solve_lp_vocabulary(
             raise RuntimeError(f"LP solve failed with {lp_solver}: {solution.message}")
 
         candidates = candidates_from_solution(tokens, lp, solution.x)
+        original_objective = float(np.dot(lp["c"], solution.x))
         num_f = lp["num_nonfree_edges"]
         num_g = lp["num_free_edges"]
         t_values = solution.x[num_f + num_g :]
@@ -420,16 +454,29 @@ def solve_lp_vocabulary(
             candidates=list(candidates),
         )
         iterations.append(iteration_result)
-        LOGGER.info(
-            "LP iteration %d solved in %.3fs: objective=%.3f nonzero_tokens=%d "
-            "fractional_colors=%d active_cuts=%d",
-            iteration,
-            solve_seconds,
-            solution.fun,
-            len(candidates),
-            fractional_colors,
-            len(existing_cut_keys),
-        )
+        if objective_perturbation > 0:
+            LOGGER.info(
+                "LP iteration %d solved in %.3fs: perturbed_bound=%.3f original_objective_at_solution=%.3f "
+                "nonzero_tokens=%d fractional_colors=%d active_cuts=%d",
+                iteration,
+                solve_seconds,
+                solution.fun,
+                original_objective,
+                len(candidates),
+                fractional_colors,
+                len(existing_cut_keys),
+            )
+        else:
+            LOGGER.info(
+                "LP iteration %d solved in %.3fs: objective=%.3f nonzero_tokens=%d "
+                "fractional_colors=%d active_cuts=%d",
+                iteration,
+                solve_seconds,
+                solution.fun,
+                len(candidates),
+                fractional_colors,
+                len(existing_cut_keys),
+            )
         if iteration_callback is not None:
             iteration_callback(iteration_result)
 
@@ -514,6 +561,17 @@ def solve_lp_vocabulary(
     return final_candidates
 
 
+def perturbed_objective(c, *, magnitude: float, seed: int):
+    c = np.asarray(c, dtype=float)
+    if magnitude <= 0:
+        return c
+    rng = np.random.default_rng(int(seed))
+    perturbed = c.copy()
+    mask = perturbed > 0
+    perturbed[mask] -= float(magnitude) * rng.random(int(np.count_nonzero(mask)))
+    return perturbed
+
+
 def lp_training_state_key(
     *,
     word_counts: Counter[str],
@@ -525,6 +583,8 @@ def lp_training_state_key(
     cut_tolerance: float,
     cut_families: tuple[str, ...],
     cut_config: CutSeparationConfig,
+    objective_perturbation: float,
+    objective_perturbation_seed: int,
     lp,
 ) -> str:
     hasher = hashlib.sha256()
@@ -538,6 +598,8 @@ def lp_training_state_key(
         "cut_tolerance": float(cut_tolerance),
         "cut_families": list(cut_families),
         "cut_config": cut_config_state_payload(cut_config),
+        "objective_perturbation": float(objective_perturbation),
+        "objective_perturbation_seed": int(objective_perturbation_seed),
     }
     hasher.update(json.dumps(cut_payload, sort_keys=True).encode("utf-8"))
     hasher.update(str(int(lp["num_tokens"])).encode("ascii"))
@@ -603,6 +665,12 @@ def load_lp_training_checkpoint(state_dir: Path, state_key: str, *, num_vars: in
         LOGGER.warning("Ignoring LP training checkpoint with incompatible solution dimensions: %s", state_dir)
         return None
     if not state_key_matches:
+        if payload.get("completed", False):
+            LOGGER.warning(
+                "Ignoring completed LP training checkpoint with corpus/config hash mismatch: %s",
+                state_path,
+            )
+            return None
         LOGGER.warning(
             "LP training checkpoint corpus/config hash differs, but dimensions match; "
             "resuming with existing cuts and current separation settings: %s",
@@ -912,6 +980,11 @@ class HighsWarmLpSolver:
         highs_presolve: str = "on",
         highs_threads: int = 0,
         highs_parallel: str = "on",
+        highs_output_flag: bool = False,
+        highs_log_to_console: bool = True,
+        highs_log_file: str | Path | None = None,
+        highs_log_dev_level: int = 0,
+        highs_analysis_level: int = 0,
     ):
         import highspy
 
@@ -928,7 +1001,14 @@ class HighsWarmLpSolver:
         self.bounds = list(zip(self.lb, self.ub))
 
         self.highs = highspy.Highs()
-        self.highs.setOptionValue("output_flag", False)
+        self.highs.setOptionValue("output_flag", bool(highs_output_flag))
+        self.highs.setOptionValue("log_to_console", bool(highs_log_to_console))
+        if highs_log_file is not None:
+            self.highs.setOptionValue("log_file", str(highs_log_file))
+        if highs_log_dev_level:
+            self.highs.setOptionValue("log_dev_level", int(highs_log_dev_level))
+        if highs_analysis_level:
+            self.highs.setOptionValue("highs_analysis_level", int(highs_analysis_level))
         self.highs.setOptionValue("solver", highs_solver)
         self.highs.setOptionValue("simplex_strategy", int(highs_simplex_strategy))
         try:
@@ -939,13 +1019,19 @@ class HighsWarmLpSolver:
         self.highs.setOptionValue("parallel", highs_parallel)
         self.highs.setOptionValue("presolve", highs_presolve)
         LOGGER.info(
-            "Configured HiGHS: solver=%s simplex_strategy=%s presolve=%s threads=%s parallel=%s load_basis=%s",
+            "Configured HiGHS: solver=%s simplex_strategy=%s presolve=%s threads=%s parallel=%s "
+            "load_basis=%s output_flag=%s log_to_console=%s log_file=%s log_dev_level=%s analysis_level=%s",
             highs_solver,
             highs_simplex_strategy,
             highs_presolve,
             highs_threads,
             highs_parallel,
             self.basis_path is not None,
+            highs_output_flag,
+            highs_log_to_console,
+            highs_log_file,
+            highs_log_dev_level,
+            highs_analysis_level,
         )
         self.highs.passModel(self._build_model())
         self.has_basis = False
@@ -958,6 +1044,7 @@ class HighsWarmLpSolver:
 
         self.highs.run()
         model_status = self.highs.getModelStatus()
+        self._log_solve_info()
         success = model_status == self.highspy.HighsModelStatus.kOptimal
         message = self.highs.modelStatusToString(model_status)
         if not success:
@@ -975,6 +1062,33 @@ class HighsWarmLpSolver:
         self.has_basis = True
         self._save_cache(result)
         return result
+
+    def _log_solve_info(self) -> None:
+        info = self.highs.getInfo()
+        LOGGER.info(
+            "HiGHS stats: rows=%d cols=%d nnz=%d simplex_iter=%s ipm_iter=%s pdlp_iter=%s basis=%s "
+            "primal_infeas=%s sum_primal_infeas=%s dual_infeas=%s sum_dual_infeas=%s "
+            "max_primal_residual=%s max_dual_residual=%s",
+            self.A_eq.shape[0] + self.A_ub.shape[0],
+            self.c.shape[0],
+            self.A_eq.nnz + self.A_ub.nnz,
+            info.simplex_iteration_count,
+            info.ipm_iteration_count,
+            info.pdlp_iteration_count,
+            info.basis_validity,
+            info.num_primal_infeasibilities,
+            self._format_info_float(info.sum_primal_infeasibilities),
+            info.num_dual_infeasibilities,
+            self._format_info_float(info.sum_dual_infeasibilities),
+            self._format_info_float(info.max_primal_residual_error),
+            self._format_info_float(info.max_dual_residual_error),
+        )
+
+    @staticmethod
+    def _format_info_float(value: float) -> str:
+        if not math.isfinite(float(value)):
+            return "n/a"
+        return f"{float(value):.6g}"
 
     def save_basis(self, basis_path: str | Path | None = None) -> None:
         path = Path(basis_path) if basis_path is not None else self.basis_path

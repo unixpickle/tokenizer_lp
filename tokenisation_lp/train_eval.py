@@ -41,6 +41,8 @@ def train_and_eval_lp(
     lp_solution_cache_dir: str | None,
     lp_solver: str,
     highs_options: HighsOptions | None,
+    objective_perturbation: float,
+    objective_perturbation_seed: int,
     resume: bool,
 ):
     saw_iteration = False
@@ -147,6 +149,8 @@ def train_and_eval_lp(
         lp_solution_cache_dir=lp_solution_cache_dir,
         lp_solver=lp_solver,
         highs_options=highs_options,
+        objective_perturbation=objective_perturbation,
+        objective_perturbation_seed=objective_perturbation_seed,
         resume=resume,
         iteration_callback=on_iteration,
     )
@@ -325,6 +329,49 @@ def parse_args() -> argparse.Namespace:
         "--lp-highs-no-load-basis",
         action="store_true",
         help="Do not load the saved HiGHS basis when resuming.",
+    )
+    parser.add_argument(
+        "--lp-highs-output",
+        action="store_true",
+        help="Enable HiGHS solver logging. By default the highspy backend suppresses HiGHS output.",
+    )
+    parser.add_argument(
+        "--lp-highs-no-console-log",
+        action="store_true",
+        help="When HiGHS logging is enabled, write only to the HiGHS log file and not stderr/stdout.",
+    )
+    parser.add_argument(
+        "--lp-highs-log-file",
+        default=None,
+        help="Optional file for HiGHS solver logs.",
+    )
+    parser.add_argument(
+        "--lp-highs-log-dev-level",
+        type=int,
+        default=0,
+        help="HiGHS log_dev_level option. Values above 0 emit more internal solver detail.",
+    )
+    parser.add_argument(
+        "--lp-highs-analysis-level",
+        type=int,
+        default=0,
+        help="HiGHS highs_analysis_level option. Values above 0 emit more simplex analysis detail.",
+    )
+    parser.add_argument(
+        "--lp-objective-perturbation",
+        type=float,
+        default=0.0,
+        help=(
+            "Maximum nonpositive random perturbation subtracted from positive LP objective "
+            "coefficients. This can break simplex degeneracy while preserving a conservative "
+            "lower bound. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--lp-objective-perturbation-seed",
+        type=int,
+        default=0,
+        help="Random seed for --lp-objective-perturbation.",
     )
     parser.add_argument(
         "--no-resume",
@@ -766,6 +813,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s %(message)s")
+    if args.lp_objective_perturbation < 0:
+        raise ValueError("--lp-objective-perturbation must be nonnegative.")
 
     train_texts = load_texts(args.data_dir)
     eval_texts = load_texts(args.eval_dir or args.data_dir)
@@ -858,6 +907,16 @@ def main() -> None:
         threads=args.lp_highs_threads,
         parallel=args.lp_highs_parallel,
         load_basis=not args.lp_highs_no_load_basis,
+        output_flag=bool(
+            args.lp_highs_output
+            or args.lp_highs_log_file
+            or args.lp_highs_log_dev_level
+            or args.lp_highs_analysis_level
+        ),
+        log_to_console=not args.lp_highs_no_console_log,
+        log_file=args.lp_highs_log_file,
+        log_dev_level=args.lp_highs_log_dev_level,
+        analysis_level=args.lp_highs_analysis_level,
     )
 
     if args.kind in {"lp", "both"}:
@@ -878,6 +937,8 @@ def main() -> None:
             lp_solution_cache_dir=args.lp_solution_cache_dir,
             lp_solver=args.lp_solver,
             highs_options=highs_options,
+            objective_perturbation=args.lp_objective_perturbation,
+            objective_perturbation_seed=args.lp_objective_perturbation_seed,
             resume=not args.no_resume,
         )
 
